@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from engine import Engine, Row, ScheduleError, parse_schedule
+from engine import _steps, Engine, Row, ScheduleError, parse_schedule
 from tcp import API_LOG, Tcp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -133,7 +133,8 @@ async def put_line(request: Request):
             rows.append(Row(line, wo, start.replace(second=0, microsecond=0), end.replace(second=0, microsecond=0),
                             codes, str(r.get("note") or "").strip(), sku=str(r.get("sku") or "").strip(),
                             sku_desc=str(r.get("sku_desc") or "").strip(), units=num(r.get("units")),
-                            workers=num(r.get("workers")), so_sku=str(r.get("so_sku") or "").strip()))
+                            workers=num(r.get("workers")), so_sku=str(r.get("so_sku") or "").strip(),
+                            steps=_steps(r.get("steps"))))
         engine.replace_line(line, rows)
     except ScheduleError as e:
         return JSONResponse({"ok": False, "message": str(e)}, 400)
@@ -300,10 +301,10 @@ def apilog_clear():
 def schedule_csv():
     """The schedule LineSwitch is following right now, as a CSV the client can open in Excel."""
     q = lambda v: '"' + str("" if v is None else (int(v) if isinstance(v, float) and v.is_integer() else v)).replace('"', "'") + '"'
-    out = ["Line,Work Order,Start,End,SO-SKU,SKU,SKU Description,Units,Workers,Cost Codes,Note"]
+    out = ["Line,Work Order,Start,End,SO-SKU,SKU,SKU Description,Units,Workers,Steps,Cost Codes,Note"]
     for r in sorted(engine.schedule, key=lambda x: (x.line.lower(), x.start)):
         out.append(",".join([q(r.line), q(r.wo), f"{r.start:%Y-%m-%d %H:%M}", f"{r.end:%Y-%m-%d %H:%M}", q(r.so_sku), q(r.sku),
-                             q(r.sku_desc), q(r.units), q(r.workers), q(";".join(r.codes)), q(r.note)]))
+                             q(r.sku_desc), q(r.units), q(r.workers), q(", ".join(r.steps)), q(";".join(r.codes)), q(r.note)]))
     return Response("\n".join(out) + "\n", media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=lineswitch_current_schedule.csv"})
 
@@ -447,9 +448,11 @@ async def settings_put(request: Request):
 def wo_plan(wo: str):
     """The cost codes LineSwitch would create in TCP for this WO, and which already exist."""
     have = {c["fullName"].upper() for c in tcp.wo_cost_codes(wo)[0]} if tcp.configured else set()
-    plan = engine.ops.planned_codes(wo)
-    return {"wo": wo, "codes": [{"name": "\\".join(c[k] for k in ("level1", "level2", "level3") if c.get(k)),
-                                  "exists": "\\".join(c[k] for k in ("level1", "level2", "level3") if c.get(k)).upper() in have} for c in plan]}
+    steps, _ = engine.steps_for(wo)
+    plan = engine.ops.planned_codes(wo, steps)
+    full = lambda c: "\\".join(c[k] for k in ("level1", "level2", "level3", "level4", "level5") if c.get(k))
+    return {"wo": wo, "from": "schedule steps" if steps else "Setup step list",
+            "codes": [{"name": full(c), "exists": full(c).upper() in have} for c in plan]}
 
 
 @app.post("/api/wo/{wo}/create")
@@ -467,12 +470,12 @@ def sample():
     """A ready to edit schedule for today using the line names found in TCP."""
     now = datetime.now().replace(minute=0, second=0, microsecond=0)
     names = [g["description"] for gid, g in engine.groups.items() if engine.lines.get(gid, {}).get("is_line")] or ["Line 1", "Line 2", "Line 3"]
-    out = ["Line,Work Order,Start,End,SO-SKU,SKU,SKU Description,Units,Workers,Note"]
+    out = ["Line,Work Order,Start,End,SO-SKU,SKU,SKU Description,Units,Workers,Steps,Note"]
     for i, n in enumerate(names[:6]):
         a = now.replace(hour=5)
         b = now.replace(hour=18)
         c = now.replace(hour=23)
-        out.append(f"{n},{112 + i * 10},{a:%Y-%m-%d %H:%M},{b:%Y-%m-%d %H:%M},387-1003{i}2,1003{i}2,Body Lotion 8oz,2400,6,Day run")
-        out.append(f"{n},{113 + i * 10},{b:%Y-%m-%d %H:%M},{c:%Y-%m-%d %H:%M},387-1003{i}3,1003{i}3,Face Cream 2oz,1200,5,Evening run")
+        out.append(f"{n},{112 + i * 10},{a:%Y-%m-%d %H:%M},{b:%Y-%m-%d %H:%M},387-1003{i}2,1003{i}2,Body Lotion 8oz,2400,6,\"SETUP, FILLING, QC\",Day run")
+        out.append(f"{n},{113 + i * 10},{b:%Y-%m-%d %H:%M},{c:%Y-%m-%d %H:%M},387-1003{i}3,1003{i}3,Face Cream 2oz,1200,5,\"SETUP, FILLING, QC\",Evening run")
     return Response("\n".join(out) + "\n", media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=lineswitch_schedule_template.csv"})
