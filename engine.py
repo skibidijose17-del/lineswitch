@@ -517,8 +517,14 @@ class Engine:
         if not old:
             return [], ""
         on_them = {norm(p["costCode"]) for p in stuck}
-        busy = {norm(l.get("live_wo")) for k, l in self.lines.items()
-                if k != gid and l.get("mode") == "live" and l.get("live_wo")}
+        busy = set()
+        for k, l in self.lines.items():
+            if k == gid or not l.get("is_line"):
+                continue
+            row = self.now_row(k)
+            for w in (l.get("live_wo"), l.get("override"), row.wo if row else None):
+                if w:
+                    busy.add(norm(w))
         wo_of = lambda c: norm(str(c.get("fullName", "")).split("\\")[0])
         held = [c for c in old if norm(c.get("fullName", "")) in on_them]
         shared = [c for c in old if c not in held and wo_of(c) in busy]
