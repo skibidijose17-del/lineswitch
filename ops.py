@@ -422,7 +422,13 @@ class Ops:
         return sorted(out, key=lambda x: x["so_sku"])
 
     # ------------------------------------------------------------ cost codes for a WO
-    def planned_codes(self, wo: str) -> list[dict]:
+    def planned_codes(self, wo: str, steps: list[str] | None = None) -> list[dict]:
+        if steps:                                    # this WO's own steps from the schedule
+            out = []
+            for st in steps:
+                parts = [p for p in st.split("\\") if p][:4]
+                out.append({"level1": str(wo).upper(), **{f"level{i + 2}": v for i, v in enumerate(parts)}})
+            return out
         roles = self.settings.get("roles") or []
         funcs = self.settings.get("functions") or []
         out = []
@@ -434,19 +440,25 @@ class Ops:
                 out.append({"level1": str(wo).upper(), "level2": role})
         return out
 
-    def create_codes(self, wo: str) -> dict:
+    def create_codes(self, wo: str, steps: list[str] | None = None, desc: str = "") -> dict:
+        if steps is None:
+            steps, desc = self.e.steps_for(wo)
+        lv = ("level1", "level2", "level3", "level4", "level5")
+        full = lambda c: "\\".join(c[k] for k in lv if c.get(k))
         have = {c["fullName"].upper() for c in self.e.tcp.wo_cost_codes(wo)[0]}
-        want = self.planned_codes(wo)
-        missing = [c for c in want if "\\".join(c[k] for k in ("level1", "level2", "level3") if c.get(k)).upper() not in have]
+        want = self.planned_codes(wo, steps)
+        missing = [c for c in want if full(c).upper() not in have]
         if not missing:
             return {"created": [], "already": len(want)}
         body = []
         for c in missing:
-            name = " ".join(x.capitalize() for x in (c.get("level3") or c["level2"]).split())
-            body.append({**c, "description": name[:50], "isActive": True, "scheduleOrg": ["default"]})
+            last = [c[k] for k in lv[1:] if c.get(k)][-1]
+            name = " ".join(x.capitalize() if len(x) > 3 else x for x in last.split())
+            text = f"{desc}: {name}" if desc else name          # Body Lotion 8oz: Capper
+            body.append({**c, "description": text[:50], "isActive": True, "scheduleOrg": ["default"]})
         self.e.tcp.create_cost_codes(body)
         self.e.tcp.drop_code_cache()
-        made = ["\\".join(c[k] for k in ("level1", "level2", "level3") if c.get(k)) for c in missing]
+        made = [full(c) for c in missing]
         self.e.note("map", "Schedule", f"Created {len(made)} cost codes for WO {wo} in TCP: {', '.join(made)}")
         return {"created": made, "already": len(want) - len(missing)}
 
