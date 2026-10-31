@@ -464,6 +464,10 @@ class Engine:
         return codes, "from job code " + wo + " groups " + ", ".join(groups)
 
     def apply(self, gid: str, wo: str, reason: str, row: Row | None = None):
+        with self.lock:   # the tablet and the switch timer can both switch a line; one at a time
+            return self._apply(gid, wo, reason, row)
+
+    def _apply(self, gid: str, wo: str, reason: str, row: Row | None = None):
         g = self.groups.get(gid)
         ln = self.lines[gid]
         name = g["description"] if g else gid
