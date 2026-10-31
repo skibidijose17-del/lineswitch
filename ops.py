@@ -315,6 +315,7 @@ class Ops:
             self.e.tcp.set_active([hit], True)
         if full not in {c["fullName"].upper() for c in self.e.tcp.group_codes(g["description"])}:
             self.e.tcp.swap_group(g, [], [hit])
+            g["codes"] = self.e.tcp.group_codes(g["description"])     # board shows Line Down right away
         return hit["fullName"]
 
     def down_start(self, gid: str, by: str):
@@ -559,9 +560,20 @@ class Ops:
             name = " ".join(x.capitalize() if len(x) > 3 else x for x in last.split())
             text = f"{desc}: {name}" if desc else name          # Body Lotion 8oz: Capper
             body.append({**c, "description": text[:50], "isActive": True, "scheduleOrg": ["default"]})
-        self.e.tcp.create_cost_codes(body)
+        failed = []
+        try:
+            self.e.tcp.create_cost_codes(body)
+        except TcpError:
+            # TCP can refuse a whole batch for one code: create them one at a time so the rest still land
+            for c in body:
+                try:
+                    self.e.tcp.create_cost_codes([c])
+                except TcpError as ex:
+                    failed.append(f"{full(c)} ({ex})")
         self.e.tcp.drop_code_cache()
-        made = [full(c) for c in missing]
+        made = [full(c) for c in missing if not any(f.startswith(full(c) + " (") for f in failed)]
+        if failed:
+            self.e.note("error", "Schedule", f"TCP would not create {len(failed)} cost codes for WO {wo}: " + "; ".join(failed))
         self.e.note("map", "Schedule", f"Created {len(made)} cost codes for WO {wo} in TCP: {', '.join(made)}")
         return {"created": made, "already": len(want) - len(missing)}
 
