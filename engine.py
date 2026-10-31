@@ -530,6 +530,7 @@ class Engine:
             return self._apply(gid, wo, reason, row)
 
     def _apply(self, gid: str, wo: str, reason: str, row: Row | None = None):
+        row = row or self.row_for(gid, wo)      # this line's own row, so it gets its own steps for a shared WO
         g = self.groups.get(gid)
         ln = self.lines[gid]
         name = g["description"] if g else gid
@@ -558,8 +559,8 @@ class Engine:
                 stuck = self.ops.on_switch(gid, old_wo, wo, reason)   # WO run record, and move people to the new WO
                 off, kept = self.retire(gid, old, stuck)
                 if reason == "tidy":
-                    if off:
-                        self.note("switch", name, f"Turned off {label(off)}, nobody is punched in on it now.")
+                    if off or kept:
+                        self.note("switch", name, (f"Turned off {label(off)}, nobody is punched in on it now." if off else "") + kept)
                 else:
                     self.note("switch", name, f"Now WO {wo} ({reason}). Added {label(add)}"
                               + (f", turned on {label(turn_on)}" if turn_on else "")
@@ -579,6 +580,20 @@ class Engine:
         if not old:
             return [], ""
         on_them = {norm(p["costCode"]) for p in stuck}
+        # codes of a WO this line runs with listed steps, that are not this line's steps: they were never meant
+        # for this kiosk (another area's steps of the same WO), so take them out of the group instead of turning off
+        mine, planned = set(), set()
+        for r in self.rows_for(gid):
+            if r.steps:
+                planned.add(norm(r.wo))
+                mine |= {norm(f"{r.wo}\\{st}") for st in self.with_down(r.steps)}
+        stray = [c for c in old if norm(c.get("fullName", "")) not in on_them
+                 and norm(str(c.get("fullName", "")).split("\\")[0]) in planned and norm(c.get("fullName", "")) not in mine]
+        if stray:
+            self.tcp.swap_group(self.groups[gid], stray, [])
+            old = [c for c in old if c not in stray]
+            if not old:
+                return [], f" Took {len(stray)} codes that belong to other areas off this kiosk: " + ", ".join(c.get("fullName", "") for c in stray) + "."
         busy = set()           # codes another line is using right now (same WO, same step)
         for k, l in self.lines.items():
             if k == gid or not l.get("is_line"):
@@ -600,6 +615,8 @@ class Engine:
             note += f" Left {lab(held)} on so {', '.join(p['name'] for p in stuck)} can punch out; it turns off once they move or clock off."
         if shared:
             note += f" Left {lab(shared)} on because that WO is running on another line; it turns off when that WO ends."
+        if stray:
+            note += f" Took {len(stray)} codes that belong to other areas off this kiosk: " + ", ".join(c.get("fullName", "") for c in stray) + "."
         return off, note
 
     def tidy(self, gid: str):
