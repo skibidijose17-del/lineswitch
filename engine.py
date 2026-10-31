@@ -470,15 +470,28 @@ class Engine:
         return next((r for r in self.rows_for(gid) if r.start > t), None)
 
     # ---------------- switching
+    def with_down(self, steps: list[str]) -> list[str]:
+        """Every WO also gets the Line Down step, so line down time is recorded in TCP against the WO."""
+        step = (self.ops.settings.get("line_down_step") or "").strip().upper()
+        return steps + [step] if steps and step and step not in steps else steps
+
     def steps_for(self, wo: str) -> tuple[list[str], str]:
         """The steps the schedule lists for a WO (first row that has them), and its SKU description."""
+        steps, desc = [], ""
         for r in sorted(self.schedule, key=lambda x: x.start):
             if norm(r.wo) == norm(wo) and r.steps:
-                return r.steps, r.sku_desc
-        return [], ""
+                steps += [st for st in r.steps if st not in steps]   # Pre-Weigh, Compounding and the line each add theirs
+                desc = desc or r.sku_desc
+        return self.with_down(steps), desc
+
+    def row_for(self, gid: str, wo: str) -> Row | None:
+        """Today's schedule row for this WO on this line, so a setup start uses that line's own steps."""
+        now = datetime.now()
+        rows = [r for r in self.rows_for(gid) if norm(r.wo) == norm(wo) and r.end > now - timedelta(hours=12)]
+        return min(rows, key=lambda r: abs((r.start - now).total_seconds()), default=None)
 
     def desired_codes(self, wo: str, row: Row | None) -> tuple[list[dict], str]:
-        steps = (row.steps if row and row.steps else self.steps_for(wo)[0])
+        steps = (self.with_down(row.steps) if row and row.steps else self.steps_for(wo)[0])
         if steps and not (row and row.codes):
             tcp_id = self.resolve(wo)
             codes = self.tcp.wo_cost_codes(tcp_id)[0]
@@ -563,17 +576,18 @@ class Engine:
         if not old:
             return [], ""
         on_them = {norm(p["costCode"]) for p in stuck}
-        busy = set()
+        busy = set()           # codes another line is using right now (same WO, same step)
         for k, l in self.lines.items():
             if k == gid or not l.get("is_line"):
                 continue
             row = self.now_row(k)
-            for w in (l.get("live_wo"), l.get("override"), row.wo if row else None):
-                if w:
-                    busy.add(norm(w))
+            wos = {norm(w) for w in (l.get("live_wo"), l.get("override"), row.wo if row else None) if w}
+            for c in (self.groups.get(k) or {}).get("codes") or []:
+                if norm(str(c.get("fullName", "")).split("\\")[0]) in wos:
+                    busy.add(norm(c.get("fullName", "")))
         wo_of = lambda c: norm(str(c.get("fullName", "")).split("\\")[0])
         held = [c for c in old if norm(c.get("fullName", "")) in on_them]
-        shared = [c for c in old if c not in held and wo_of(c) in busy]
+        shared = [c for c in old if c not in held and norm(c.get("fullName", "")) in busy]
         off = [c for c in old if c not in held and c not in shared]
         if off:
             self.tcp.set_active(off, False)
@@ -602,7 +616,8 @@ class Engine:
                 if not g or not ln.get("is_line") or ln.get("hold"):
                     continue
                 if ln.get("override"):
-                    target, row = ln["override"], None
+                    target = ln["override"]
+                    row = self.row_for(gid, target)
                     reason = ("started by setup" + (f" ({ln['started_by']})" if ln.get("started_by") else "")) if ln.get("started_by") else "set by hand"
                 elif self.ops.settings.get("start_mode") == "setup":
                     continue                             # the setup person starts each WO from the line tablet
