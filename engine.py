@@ -497,6 +497,9 @@ class Engine:
             codes = self.tcp.wo_cost_codes(tcp_id)[0]
             names = {norm(f"{tcp_id}\\{st}") for st in steps}
             pick = [c for c in codes if norm(c["fullName"]) in names]
+            if not pick:
+                # the scheduler listed this area's steps but TCP doesn't have them yet: don't fall back to every code of the WO
+                raise TcpError(404, f"WO {tcp_id} steps are not in TCP yet: {', '.join(steps)}")
             if pick:
                 order = [norm(f"{tcp_id}\\{st}") for st in steps]
                 pick.sort(key=lambda c: order.index(norm(c["fullName"])))
