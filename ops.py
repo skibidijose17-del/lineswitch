@@ -171,6 +171,7 @@ class Ops:
         if need:
             back = [c for c in self.e.tcp.wo_cost_codes(old_wo)[0] if c.get("fullName", "").upper() in need]
             if back:
+                self.e.tcp.set_active([c for c in back if c.get("isActive") is False], True)
                 self.e.tcp.swap_group(g, [], back)
         moved, failed = [], []
         self.last_failed = []
