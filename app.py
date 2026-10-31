@@ -5,7 +5,7 @@ import base64
 import hmac
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, File, Request, UploadFile
@@ -129,8 +129,11 @@ async def put_line(request: Request):
             codes = r.get("codes") or []
             if isinstance(codes, str):
                 codes = [c.strip() for c in codes.replace(";", ",").split(",") if c.strip()]
+            num = lambda v: None if v in (None, "") else float(str(v).replace(",", ""))
             rows.append(Row(line, wo, start.replace(second=0, microsecond=0), end.replace(second=0, microsecond=0),
-                            codes, str(r.get("note") or "").strip()))
+                            codes, str(r.get("note") or "").strip(), sku=str(r.get("sku") or "").strip(),
+                            sku_desc=str(r.get("sku_desc") or "").strip(), units=num(r.get("units")),
+                            workers=num(r.get("workers")), so_sku=str(r.get("so_sku") or "").strip()))
         engine.replace_line(line, rows)
     except ScheduleError as e:
         return JSONResponse({"ok": False, "message": str(e)}, 400)
@@ -224,7 +227,7 @@ async def switch(gid: str, request: Request):
     if not wo:
         return JSONResponse({"ok": False, "message": "Type a work order number"}, 400)
     ln = _line(gid)
-    ln["override"], ln["hold"] = wo, False
+    ln["override"], ln["hold"], ln["started_by"] = wo, False, ""
     engine.apply(gid, wo, "set by hand")
     return engine.view()
 
@@ -241,7 +244,7 @@ def hold(gid: str):
 @app.post("/api/lines/{gid}/resume")
 def resume(gid: str):
     ln = _line(gid)
-    ln["hold"], ln["override"], ln["retry_at"], ln["error"] = False, None, 0, ""
+    ln["hold"], ln["override"], ln["retry_at"], ln["error"], ln["started_by"] = False, None, 0, "", ""
     engine.note("resume", engine.groups.get(gid, {}).get("description", gid), "Following the schedule again")
     engine.save()
     engine.tick()
@@ -296,12 +299,164 @@ def apilog_clear():
 @app.get("/api/schedule.csv")
 def schedule_csv():
     """The schedule LineSwitch is following right now, as a CSV the client can open in Excel."""
-    out = ["Line,Work Order,Start,End,Cost Codes,Note"]
+    q = lambda v: '"' + str("" if v is None else (int(v) if isinstance(v, float) and v.is_integer() else v)).replace('"', "'") + '"'
+    out = ["Line,Work Order,Start,End,SO-SKU,SKU,SKU Description,Units,Workers,Cost Codes,Note"]
     for r in sorted(engine.schedule, key=lambda x: (x.line.lower(), x.start)):
-        note = (r.note or "").replace('"', "'")
-        out.append(f'{r.line},{r.wo},{r.start:%Y-%m-%d %H:%M},{r.end:%Y-%m-%d %H:%M},"{";".join(r.codes)}","{note}"')
+        out.append(",".join([q(r.line), q(r.wo), f"{r.start:%Y-%m-%d %H:%M}", f"{r.end:%Y-%m-%d %H:%M}", q(r.so_sku), q(r.sku),
+                             q(r.sku_desc), q(r.units), q(r.workers), q(";".join(r.codes)), q(r.note)]))
     return Response("\n".join(out) + "\n", media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=lineswitch_current_schedule.csv"})
+
+
+# ---------------------------------------------------------------- line tablet (setup person)
+def _ok(fn):
+    try:
+        out = fn()
+    except (ValueError, ScheduleError) as e:
+        return JSONResponse({"ok": False, "message": str(e)}, 400)
+    except Exception as e:  # noqa
+        return JSONResponse({"ok": False, "message": f"TCP: {e}"}, 502)
+    return {"ok": True, "result": out, "state": engine.view()}
+
+
+@app.get("/api/lines/{gid}/today")
+def line_today(gid: str):
+    """The WOs the setup person can start on this line today, and who is clocked in on it right now."""
+    out = {"wos": engine.ops.todays_wos(gid), "people": [], "people_error": ""}
+    try:
+        out["people"] = engine.ops.people(gid)
+    except Exception as e:  # noqa
+        out["people_error"] = str(e)
+    return out
+
+
+@app.post("/api/lines/{gid}/start")
+async def line_start(gid: str, request: Request):
+    b = await request.json()
+    return _ok(lambda: engine.ops.start_wo(gid, str(b.get("wo", "")).strip(), str(b.get("by", "")).strip()))
+
+
+@app.post("/api/lines/{gid}/end")
+async def line_end(gid: str, request: Request):
+    b = await request.json()
+    kind = "shift" if b.get("kind") == "shift" else "wo"
+    return _ok(lambda: engine.ops.end(gid, kind, str(b.get("by", "")).strip()))
+
+
+@app.post("/api/lines/{gid}/down")
+async def line_down(gid: str, request: Request):
+    b = await request.json()
+    return _ok(lambda: engine.ops.down_start(gid, str(b.get("by", "")).strip()))
+
+
+@app.post("/api/lines/{gid}/up")
+async def line_up(gid: str, request: Request):
+    b = await request.json()
+    return _ok(lambda: engine.ops.down_end(gid, str(b.get("reason", "")).strip(), str(b.get("notes", "")).strip(), str(b.get("by", "")).strip()))
+
+
+@app.post("/api/lines/{gid}/move")
+def line_move(gid: str):
+    """Move everyone on the line who is still on an older WO to the line's current WO."""
+    ln = engine.lines.get(gid) or {}
+    def go():
+        wo = ln.get("live_wo")
+        if not wo:
+            raise ValueError("this line has no work order yet")
+        moved = []
+        for p in engine.ops.people(gid):
+            old = (p["costCode"] or "").split("\\")[0]
+            if old and old != wo:
+                moved += engine.ops.move_workers(gid, old, wo)
+        engine.note("switch", engine.groups.get(gid, {}).get("description", gid), f"Moved {len(moved)} people to WO {wo}" + (": " + ", ".join(moved) if moved else ""))
+        engine.save()
+        return moved
+    return _ok(go)
+
+
+# ---------------------------------------------------------------- WO runs, downtime, reports, settings
+def _range(start: str, end: str):
+    now = datetime.now()
+    a = datetime.fromisoformat(start) if start else now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=6)
+    z = datetime.fromisoformat(end) if end else now
+    if len(end or "") <= 10 and end:
+        z = z.replace(hour=23, minute=59, second=59)
+    return a, z
+
+
+@app.get("/api/runs")
+def runs(start: str = "", end: str = "", line: str = "", hours: int = 1):
+    a, z = _range(start, end)
+    rows = [engine.ops.run_report(r, with_labor=bool(hours)) for r in engine.ops.runs_between(a, z, line)]
+    return {"start": a.isoformat(), "end": z.isoformat(), "runs": rows, "so_sku": engine.ops.so_sku_report(rows),
+            "rate": engine.ops.settings.get("labor_rate"), "exclude": engine.ops.settings.get("exclude_from_cost")}
+
+
+@app.put("/api/runs/{rid}")
+async def run_edit(rid: str, request: Request):
+    b = await request.json()
+    return _ok(lambda: engine.ops.run_report(engine.ops.edit_run(rid, b)))
+
+
+@app.get("/api/runs.csv")
+def runs_csv(start: str = "", end: str = "", line: str = ""):
+    a, z = _range(start, end)
+    rows = [engine.ops.run_report(r) for r in engine.ops.runs_between(a, z, line)]
+    head = ["Line", "WO", "SO-SKU", "SKU", "SKU description", "Start", "End", "Started by", "People", "Hours", "Hours in cost",
+            "Labor cost", "Units planned", "FG units accepted", "Units used", "Unit filling cost", "Downtime min"]
+    out = [",".join(head)]
+    q = lambda v: '"' + str("" if v is None else v).replace('"', "'") + '"'
+    for r in rows:
+        out.append(",".join(q(x) for x in [r["line"], r["wo"], r.get("so_sku"), r.get("sku"), r.get("sku_desc"), r["start"], r.get("end") or "",
+                                            r.get("started_by"), r.get("people"), r.get("hours"), r.get("cost_hours"), r.get("labor_cost"),
+                                            r.get("units"), r.get("units_accepted"), r.get("units_used"), r.get("unit_cost"), r.get("downtime_min")]))
+    return Response("\n".join(out) + "\n", media_type="text/csv", headers={"Content-Disposition": "attachment; filename=lineswitch_work_orders.csv"})
+
+
+@app.get("/api/downtime")
+def downtime(start: str = "", end: str = ""):
+    a, z = _range(start, end)
+    rows = [d for d in engine.ops.downtime if datetime.fromisoformat(d["start"]) <= z and (not d.get("end") or datetime.fromisoformat(d["end"]) >= a)]
+    for d in rows:
+        e = datetime.fromisoformat(d["end"]) if d.get("end") else datetime.now()
+        d["minutes"] = round((e - datetime.fromisoformat(d["start"])).total_seconds() / 60)
+    return {"rows": sorted(rows, key=lambda x: x["start"], reverse=True), "reasons": engine.ops.settings.get("downtime_reasons")}
+
+
+@app.put("/api/downtime/{did}")
+async def downtime_edit(did: str, request: Request):
+    b = await request.json()
+    return _ok(lambda: engine.ops.edit_downtime(did, b))
+
+
+@app.get("/api/settings")
+def settings_get():
+    return engine.ops.settings
+
+
+@app.put("/api/settings")
+async def settings_put(request: Request):
+    b = await request.json()
+    return _ok(lambda: engine.ops.set_settings(b))
+
+
+@app.get("/api/wo/{wo}/plan")
+def wo_plan(wo: str):
+    """The cost codes LineSwitch would create in TCP for this WO, and which already exist."""
+    have = {c["fullName"].upper() for c in tcp.wo_cost_codes(wo)[0]} if tcp.configured else set()
+    plan = engine.ops.planned_codes(wo)
+    return {"wo": wo, "codes": [{"name": "\\".join(c[k] for k in ("level1", "level2", "level3") if c.get(k)),
+                                  "exists": "\\".join(c[k] for k in ("level1", "level2", "level3") if c.get(k)).upper() in have} for c in plan]}
+
+
+@app.post("/api/wo/{wo}/create")
+def wo_create(wo: str):
+    def go():
+        out = engine.ops.create_codes(wo)
+        engine.validate([wo])
+        engine.tick()
+        return out
+    return _ok(go)
 
 
 @app.get("/api/sample")
@@ -309,12 +464,12 @@ def sample():
     """A ready to edit schedule for today using the line names found in TCP."""
     now = datetime.now().replace(minute=0, second=0, microsecond=0)
     names = [g["description"] for gid, g in engine.groups.items() if engine.lines.get(gid, {}).get("is_line")] or ["Line 1", "Line 2", "Line 3"]
-    out = ["Line,Work Order,Start,End,Cost Codes,Note"]
+    out = ["Line,Work Order,Start,End,SO-SKU,SKU,SKU Description,Units,Workers,Note"]
     for i, n in enumerate(names[:6]):
         a = now.replace(hour=5)
         b = now.replace(hour=18)
         c = now.replace(hour=23)
-        out.append(f"{n},{112 + i * 10},{a:%Y-%m-%d %H:%M},{b:%Y-%m-%d %H:%M},,Day run")
-        out.append(f"{n},{113 + i * 10},{b:%Y-%m-%d %H:%M},{c:%Y-%m-%d %H:%M},,Evening run")
+        out.append(f"{n},{112 + i * 10},{a:%Y-%m-%d %H:%M},{b:%Y-%m-%d %H:%M},387-1003{i}2,1003{i}2,Body Lotion 8oz,2400,6,Day run")
+        out.append(f"{n},{113 + i * 10},{b:%Y-%m-%d %H:%M},{c:%Y-%m-%d %H:%M},387-1003{i}3,1003{i}3,Face Cream 2oz,1200,5,Evening run")
     return Response("\n".join(out) + "\n", media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=lineswitch_schedule_template.csv"})

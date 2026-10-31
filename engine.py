@@ -27,6 +27,15 @@ from tcp import Tcp, TcpError
 log = logging.getLogger("lineswitch")
 
 
+def _num(v):
+    if v in (None, ""):
+        return None
+    try:
+        return float(str(v).replace(",", ""))
+    except ValueError:
+        return None
+
+
 def norm(s) -> str:
     return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
 
@@ -41,6 +50,11 @@ class Row:
     codes: list[str] = field(default_factory=list)   # optional: cost codes listed in the file
     note: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
+    sku: str = ""          # optional order details from the scheduler's file
+    sku_desc: str = ""
+    units: float | None = None      # production units planned (budget units)
+    workers: float | None = None    # workers planned (budget workers)
+    so_sku: str = ""                # Sales Order + SKU, links WOs together (387-100312)
 
     def covers(self, t: datetime) -> bool:
         return self.start <= t < self.end
@@ -53,15 +67,19 @@ class Row:
     @staticmethod
     def from_json(d):
         return Row(d["line"], d["wo"], datetime.fromisoformat(d["start"]), datetime.fromisoformat(d["end"]),
-                   d.get("codes") or [], d.get("note", ""), d.get("id") or uuid.uuid4().hex[:10])
+                   d.get("codes") or [], d.get("note", ""), d.get("id") or uuid.uuid4().hex[:10],
+                   d.get("sku", "") or "", d.get("sku_desc", "") or "", _num(d.get("units")), _num(d.get("workers")), d.get("so_sku", "") or "")
 
 
 HEAD = {
     "line": "line", "clockconfiguration": "line", "costcodegroup": "line", "kiosk": "line", "group": "line",
     "workorder": "wo", "wo": "wo", "wonumber": "wo", "jobcode": "wo", "job": "wo",
     "start": "start", "starttime": "start", "from": "start", "end": "end", "endtime": "end", "to": "end",
-    "date": "date", "costcodes": "codes", "costcode": "codes", "note": "note", "notes": "note",
-    "description": "note",
+    "date": "date", "costcodes": "codes", "costcode": "codes", "note": "note", "notes": "note", "comment": "note",
+    "sku": "sku", "item": "sku", "skudescription": "sku_desc", "description": "sku_desc", "product": "sku_desc", "productdescription": "sku_desc",
+    "units": "units", "productionunits": "units", "plannedunits": "units", "budgetunits": "units", "qty": "units", "quantity": "units",
+    "workers": "workers", "workersassigned": "workers", "numberofworkers": "workers", "budgetworkers": "workers", "crew": "workers", "headcount": "workers",
+    "sosku": "so_sku", "salesordersku": "so_sku", "salesorder": "so_sku", "so": "so_sku",
 }
 FORMATS = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y %I:%M %p",
            "%m/%d/%y %H:%M", "%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d %I:%M %p"]
@@ -120,7 +138,12 @@ def parse_schedule(name: str, data: bytes) -> list[Row]:
         if wo.endswith(".0"):
             wo = wo[:-2]
         codes = [c.strip() for c in str(r.get("codes") or "").replace(";", ",").split(",") if c.strip()]
-        rows.append(Row(str(r["line"]).strip(), wo, start, end, codes, str(r.get("note") or "").strip()))
+        so = str(r.get("so_sku") or "").strip()
+        if so.endswith(".0"):
+            so = so[:-2]
+        rows.append(Row(str(r["line"]).strip(), wo, start, end, codes, str(r.get("note") or "").strip(),
+                        sku=str(r.get("sku") or "").strip().removesuffix(".0"), sku_desc=str(r.get("sku_desc") or "").strip(),
+                        units=_num(r.get("units")), workers=_num(r.get("workers")), so_sku=so))
     check_overlaps(rows)
     return rows
 
@@ -151,6 +174,8 @@ class Engine:
         self.checks: dict[str, dict] = {}     # schedule WO -> {status, tcp, codes, groups, message, suggestions}
         self.schedule_updated = ""            # when the schedule last changed, and how
         self.store = Store()
+        from ops import Ops
+        self.ops = Ops(self)
         self._load()
 
     # ---------------- persistence (Neon Postgres when DATABASE_URL is set, else state.json)
@@ -168,6 +193,7 @@ class Engine:
             self.line_map = s.get("line_map", {})
             self.checks = s.get("checks", {})
             self.schedule_updated = s.get("schedule_updated", "")
+            self.ops.load(s.get("ops"))
         except Exception as e:  # noqa
             log.warning("saved state unreadable: %s", e)
 
@@ -177,7 +203,7 @@ class Engine:
                              "preview": self.preview, "activity": self.activity[:300],
                              "schedule_file": self.schedule_file, "wo_map": self.wo_map,
                              "line_map": self.line_map, "checks": self.checks,
-                             "schedule_updated": self.schedule_updated})
+                             "schedule_updated": self.schedule_updated, "ops": self.ops.dump()})
 
     def version(self, reason: str):
         self.store.version([r.to_json() for r in self.schedule], reason)
@@ -201,7 +227,9 @@ class Engine:
         codes = d.get("codes") or []
         if isinstance(codes, str):
             codes = [c.strip() for c in codes.replace(";", ",").split(",") if c.strip()]
-        r = Row(line, wo, start.replace(second=0, microsecond=0), end.replace(second=0, microsecond=0), codes, str(d.get("note") or "").strip())
+        r = Row(line, wo, start.replace(second=0, microsecond=0), end.replace(second=0, microsecond=0), codes, str(d.get("note") or "").strip(),
+                sku=str(d.get("sku") or "").strip(), sku_desc=str(d.get("sku_desc") or "").strip(),
+                units=_num(d.get("units")), workers=_num(d.get("workers")), so_sku=str(d.get("so_sku") or "").strip())
         if keep_id:
             r.id = keep_id
         return r
@@ -292,7 +320,7 @@ class Engine:
                 if ln.get("is_line") is None:
                     # groups named like "Line 1" are the line (kiosk) groups; in job code mode,
                     # groups not tied to any job code count as lines too
-                    named = norm(new[gid]["description"]).startswith("line")
+                    named = norm(new[gid]["description"]).startswith(("line", "preweigh", "compounding", "area"))
                     ln["is_line"] = named if self.tcp.wo_source == "level1" else (named or not new[gid]["jobCodeAssignments"])
             for gid, g in new.items():
                 if self.lines[gid]["is_line"]:
@@ -340,10 +368,17 @@ class Engine:
             try:
                 if self.tcp.wo_source == "level1":
                     codes, groups = self.tcp.wo_cost_codes(tcp_id)
+                    if not codes and self.ops.settings.get("auto_create"):
+                        try:
+                            self.ops.create_codes(tcp_id)
+                            codes, groups = self.tcp.wo_cost_codes(tcp_id)
+                        except Exception as ex:  # noqa
+                            chk["message"] = f"could not create its cost codes in TCP: {ex}"
+
                     chk["codes"], chk["groups"] = codes, groups
                     if not codes:
                         chk["status"] = "missing"
-                        chk["message"] = f"No active cost codes with Level 1 = {tcp_id} in TCP"
+                        chk["message"] = chk["message"] or f"No active cost codes with Level 1 = {tcp_id} in TCP"
                         if all_jobs is None:
                             try:
                                 all_jobs = self.tcp.level1_values()
@@ -432,6 +467,7 @@ class Engine:
         g = self.groups.get(gid)
         ln = self.lines[gid]
         name = g["description"] if g else gid
+        old_wo = ln.get("live_wo") if ln.get("mode") == "live" else None
         try:
             want, source = self.desired_codes(wo, row)
             have = self.tcp.group_codes(g["description"])
@@ -449,6 +485,8 @@ class Engine:
                 g["codes"] = self.tcp.group_codes(g["description"])
             ln["live_wo"], ln["error"], ln["retry_at"] = wo, "", 0
             ln["mode"] = "preview" if self.preview else "live"
+            if not self.preview:
+                self.ops.on_switch(gid, old_wo, wo, reason)   # WO run record, and move people to the new WO
         except Exception as e:  # noqa
             ln["error"] = str(e)
             ln["retry_at"] = time.time() + 120
@@ -465,7 +503,10 @@ class Engine:
                 if not g or not ln.get("is_line") or ln.get("hold"):
                     continue
                 if ln.get("override"):
-                    target, row, reason = ln["override"], None, "set by hand"
+                    target, row = ln["override"], None
+                    reason = ("started by setup" + (f" ({ln['started_by']})" if ln.get("started_by") else "")) if ln.get("started_by") else "set by hand"
+                elif self.ops.settings.get("start_mode") == "setup":
+                    continue                             # the setup person starts each WO from the line tablet
                 else:
                     row = self.now_row(gid, now)
                     if not row:
@@ -517,7 +558,7 @@ class Engine:
                 "id": gid, "name": g["description"], "is_line": bool(ln.get("is_line")),
                 "jobCodeAssignments": g["jobCodeAssignments"], "codes": g["codes"],
                 "live_wo": ln.get("live_wo"), "mode": ln.get("mode"), "hold": ln.get("hold", False),
-                "override": ln.get("override"), "error": ln.get("error", ""),
+                "override": ln.get("override"), "started_by": ln.get("started_by", ""), "error": ln.get("error", ""),
                 "now": cur.to_json() if cur else None, "next": nxt.to_json() if nxt else None,
                 "next_codes": (self.checks.get(self.resolve(nxt.wo), self.checks.get(nxt.wo, {})) or {}).get("codes", []) if nxt else [],
                 "rows": [r.to_json() for r in rows],
@@ -534,6 +575,9 @@ class Engine:
                 "ok_count": sum(1 for w in now_wos if self.checks.get(w, {}).get("status") == "ok"),
                 "wo_total": len(now_wos), "wo_map": self.wo_map, "wo_source": self.tcp.wo_source,
                 "storage": self.store.status(), "schedule_updated": self.schedule_updated,
+                "settings": self.ops.settings,
+                "runs_open": {r["line"]: r for r in self.ops.runs if not r.get("end")},
+                "down_open": {d["line"]: d for d in self.ops.downtime if not d.get("end")},
                 "wo_steps": {w: [c.get("fullName") or c.get("description") or c.get("id") for c in (self.checks.get(w) or {}).get("codes", [])]
                              for w in now_wos},
                 "plan": [{"time": r.start.isoformat(), "line": r.line, "wo": r.wo, "end": r.end.isoformat(), "note": r.note}
