@@ -477,33 +477,31 @@ class Engine:
             have = self.tcp.group_codes(g["description"])
             key = lambda c: norm(c.get("fullName") or c.get("id"))
             want_k, have_k = {key(c) for c in want}, {key(c) for c in have}
-            remove = [c for c in have if key(c) not in want_k]
             add = [c for c in want if key(c) not in have_k]
+            turn_on = [c for c in want if c.get("isActive") is False or not self.tcp.is_active(c.get("fullName", ""))]
+            # Old WOs stay on the line and are turned off, not removed: TCP only lets a manager edit a punch
+            # while its cost code is on the line, and an inactive code is hidden at the kiosk.
+            old = [c for c in have if key(c) not in want_k and self.tcp.is_active(c.get("fullName", ""))]
             label = lambda cs: ", ".join(c.get("fullName") or c.get("description") or c.get("id") for c in cs) or "nothing"
             if self.preview:
-                self.note("preview", name, f"WO {wo} ({reason}): would remove {label(remove)}; add {label(add)}. Cost codes {source}.")
+                if reason != "tidy":
+                    self.note("preview", name, f"WO {wo} ({reason}): would turn off {label(old)}; add {label(add)}"
+                              + (f"; turn on {label(turn_on)}" if turn_on else "") + f". Cost codes {source}.")
             else:
-                # TCP only accepts a punch when the cost code on both sides of it is in the line's group.
-                # So: add the new WO's codes, move the people, and only then take the old codes out.
+                if turn_on:
+                    self.tcp.set_active(turn_on, True)
                 if add:
                     self.tcp.swap_group(g, [], add)
                 ln["live_wo"], ln["error"], ln["retry_at"], ln["mode"] = wo, "", 0, "live"
                 stuck = self.ops.on_switch(gid, old_wo, wo, reason)   # WO run record, and move people to the new WO
-                kept = ""
-                if remove and stuck:
-                    old_k = {norm(p["costCode"]) for p in stuck}
-                    keep = [c for c in remove if key(c) in old_k]
-                    remove = [c for c in remove if key(c) not in old_k]
-                    who = ", ".join(p["name"] for p in stuck)
-                    kept = (f" Kept {label(keep)} on the line so {who} can still punch out."
-                            " It comes off once they move or clock off.") if keep else ""
-                if remove:
-                    self.tcp.swap_group(g, remove, [])
+                off, kept = self.retire(gid, old, stuck)
                 if reason == "tidy":
-                    if remove:
-                        self.note("switch", name, f"Took {label(remove)} off the line, nobody is punched in on it now.")
+                    if off:
+                        self.note("switch", name, f"Turned off {label(off)}, nobody is punched in on it now.")
                 else:
-                    self.note("switch", name, f"Now WO {wo} ({reason}). Removed {label(remove)}; added {label(add)}.{kept}")
+                    self.note("switch", name, f"Now WO {wo} ({reason}). Added {label(add)}"
+                              + (f", turned on {label(turn_on)}" if turn_on else "")
+                              + f"; turned off {label(off)}.{kept}")
                 g["codes"] = self.tcp.group_codes(g["description"])
             ln["live_wo"], ln["error"], ln["retry_at"] = wo, "", 0
             ln["mode"] = "preview" if self.preview else "live"
@@ -513,8 +511,30 @@ class Engine:
             self.note("error", name, f"Could not switch to WO {wo}: {e}")
         self.save()
 
+    def retire(self, gid: str, old: list[dict], stuck: list[dict]):
+        """Turn off old WO codes on a line, except ones someone is still punched in on
+        and ones whose WO is running on another line right now. Returns (turned off, note)."""
+        if not old:
+            return [], ""
+        on_them = {norm(p["costCode"]) for p in stuck}
+        busy = {norm(l.get("live_wo")) for k, l in self.lines.items()
+                if k != gid and l.get("mode") == "live" and l.get("live_wo")}
+        wo_of = lambda c: norm(str(c.get("fullName", "")).split("\\")[0])
+        held = [c for c in old if norm(c.get("fullName", "")) in on_them]
+        shared = [c for c in old if c not in held and wo_of(c) in busy]
+        off = [c for c in old if c not in held and c not in shared]
+        if off:
+            self.tcp.set_active(off, False)
+        lab = lambda cs: ", ".join(c.get("fullName", "") for c in cs)
+        note = ""
+        if held:
+            note += f" Left {lab(held)} on so {', '.join(p['name'] for p in stuck)} can punch out; it turns off once they move or clock off."
+        if shared:
+            note += f" Left {lab(shared)} on because that WO is running on another line; it turns off when that WO ends."
+        return off, note
+
     def tidy(self, gid: str):
-        """Take leftover codes from an old WO off the line once nobody is punched in on them."""
+        """Turn off leftover codes from an old WO once nobody is punched in on them."""
         ln = self.lines.get(gid) or {}
         if self.preview or ln.get("mode") != "live" or not ln.get("live_wo"):
             return
@@ -583,7 +603,7 @@ class Engine:
             rows = [r for r in self.rows_for(gid) if r.end > now - timedelta(hours=12) and r.start < now + timedelta(hours=36)]
             lines.append({
                 "id": gid, "name": g["description"], "is_line": bool(ln.get("is_line")),
-                "jobCodeAssignments": g["jobCodeAssignments"], "codes": g["codes"],
+                "jobCodeAssignments": g["jobCodeAssignments"], "codes": [c for c in g["codes"] if c.get("isActive", True)],
                 "live_wo": ln.get("live_wo"), "mode": ln.get("mode"), "hold": ln.get("hold", False),
                 "override": ln.get("override"), "started_by": ln.get("started_by", ""), "error": ln.get("error", ""),
                 "now": cur.to_json() if cur else None, "next": nxt.to_json() if nxt else None,
