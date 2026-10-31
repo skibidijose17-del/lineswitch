@@ -479,19 +479,42 @@ class Engine:
             if self.preview:
                 self.note("preview", name, f"WO {wo} ({reason}): would remove {label(remove)}; add {label(add)}. Cost codes {source}.")
             else:
-                if remove or add:
-                    self.tcp.swap_group(g, remove, add)
-                self.note("switch", name, f"Now WO {wo} ({reason}). Removed {label(remove)}; added {label(add)}.")
+                # TCP only accepts a punch when the cost code on both sides of it is in the line's group.
+                # So: add the new WO's codes, move the people, and only then take the old codes out.
+                if add:
+                    self.tcp.swap_group(g, [], add)
+                ln["live_wo"], ln["error"], ln["retry_at"], ln["mode"] = wo, "", 0, "live"
+                stuck = self.ops.on_switch(gid, old_wo, wo, reason)   # WO run record, and move people to the new WO
+                kept = ""
+                if remove and stuck:
+                    old_k = {norm(p["costCode"]) for p in stuck}
+                    keep = [c for c in remove if key(c) in old_k]
+                    remove = [c for c in remove if key(c) not in old_k]
+                    who = ", ".join(p["name"] for p in stuck)
+                    kept = (f" Kept {label(keep)} on the line so {who} can still punch out."
+                            " It comes off once they move or clock off.") if keep else ""
+                if remove:
+                    self.tcp.swap_group(g, remove, [])
+                if reason == "tidy":
+                    if remove:
+                        self.note("switch", name, f"Took {label(remove)} off the line, nobody is punched in on it now.")
+                else:
+                    self.note("switch", name, f"Now WO {wo} ({reason}). Removed {label(remove)}; added {label(add)}.{kept}")
                 g["codes"] = self.tcp.group_codes(g["description"])
             ln["live_wo"], ln["error"], ln["retry_at"] = wo, "", 0
             ln["mode"] = "preview" if self.preview else "live"
-            if not self.preview:
-                self.ops.on_switch(gid, old_wo, wo, reason)   # WO run record, and move people to the new WO
         except Exception as e:  # noqa
             ln["error"] = str(e)
             ln["retry_at"] = time.time() + 120
             self.note("error", name, f"Could not switch to WO {wo}: {e}")
         self.save()
+
+    def tidy(self, gid: str):
+        """Take leftover codes from an old WO off the line once nobody is punched in on them."""
+        ln = self.lines.get(gid) or {}
+        if self.preview or ln.get("mode") != "live" or not ln.get("live_wo"):
+            return
+        self.apply(gid, ln["live_wo"], "tidy")
 
     def tick(self):
         if not self.tcp.configured:
