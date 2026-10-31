@@ -27,6 +27,9 @@ DEFAULTS = {
     "exclude_from_cost": ["LINE REPAIR"],
     # create the cost codes in TCP for a WO in the schedule that doesn't have them yet
     "auto_create": False,
+    # line down is recorded in TCP: every WO gets this step (101\\LINE DOWN) and Line down moves everyone on the
+    # line to it; Line back up puts each person back on their own step. Empty = record line down in LineSwitch only.
+    "line_down_step": "LINE DOWN",
     "downtime_reasons": ["Machine jam", "Labeler issue", "Material shortage", "Changeover", "Quality hold", "Waiting on maintenance", "Other"],
 }
 
@@ -69,6 +72,8 @@ class Ops:
                 v = max(0.0, float(v))
             elif k in ("move_on_switch", "auto_create"):
                 v = bool(v)
+            elif k == "line_down_step":
+                v = str(v or "").strip().upper()
             elif k == "start_mode":
                 v = "setup" if v == "setup" else "schedule"
             elif k in ("roles", "functions", "exclude_from_cost", "downtime_reasons"):
@@ -158,7 +163,10 @@ class Ops:
 
     def move_workers(self, gid: str, old_wo: str, new_wo: str) -> list[str]:
         """Everyone on the line still on an old WO step moves to the same step of the new WO, or its first step."""
-        new_codes = [c["fullName"] for c in self.e.tcp.wo_cost_codes(new_wo)[0]]
+        try:   # in the WO's own step order (schedule Steps column), so the fallback is its first step, like SETUP
+            new_codes = [c["fullName"] for c in self.e.desired_codes(new_wo, None)[0]]
+        except Exception:  # noqa
+            new_codes = [c["fullName"] for c in self.e.tcp.wo_cost_codes(new_wo)[0]]
         if not new_codes:
             return []
         g = self._group(gid)
@@ -270,6 +278,9 @@ class Ops:
             self.e.note("error", name, f"Could not clock everyone off the line: {ex}")
             self.e.save()
             raise ValueError(str(ex))   # the run stays open so the setup person can fix it and press End again
+        down = next((x for x in reversed(self.downtime) if x["line"] == name and not x.get("end")), None)
+        if down:                                          # ended while the line was down: close the downtime too
+            down["end"], down["reason"] = _iso(_now()), down.get("reason") or ("WO ended while down" if kind == "wo" else "Shift ended while down")
         run = self.open_run(name)
         if run and not self.e.preview:
             run["end"], run["end_reason"] = _iso(_now()), ("WO end" if kind == "wo" else "shift end") + (f" ({by})" if by else "")
@@ -284,18 +295,77 @@ class Ops:
         self.e.save()
         return {"clocked_off": off}
 
+    # ------------------------------------------------------------ line down, recorded in TCP
+    def down_code(self, gid: str, wo: str) -> str | None:
+        """Make sure WO\\LINE DOWN exists, is on, and is on the line's kiosk. Returns its full name."""
+        step = (self.settings.get("line_down_step") or "").strip().upper()
+        if not step or not wo:
+            return None
+        g = self._group(gid)
+        full = f"{str(wo).upper()}\\{step}"
+        codes = self.e.tcp.wo_cost_codes(wo)[0]
+        hit = next((c for c in codes if c["fullName"].upper() == full), None)
+        if not hit:
+            _, desc = self.e.steps_for(wo)
+            self.create_codes(wo, [step], desc)
+            hit = next((c for c in self.e.tcp.wo_cost_codes(wo)[0] if c["fullName"].upper() == full), None)
+            if not hit:
+                raise TcpError(404, f"could not create {full} in TCP")
+        if hit.get("isActive") is False:
+            self.e.tcp.set_active([hit], True)
+        if full not in {c["fullName"].upper() for c in self.e.tcp.group_codes(g["description"])}:
+            self.e.tcp.swap_group(g, [], [hit])
+        return hit["fullName"]
+
     def down_start(self, gid: str, by: str):
         g = self._group(gid)
         name = g["description"]
         if any(d for d in self.downtime if d["line"] == name and not d.get("end")):
             raise ValueError(f"{name} is already down")
         run = self.open_run(name)
-        d = {"id": uuid.uuid4().hex[:10], "line": name, "wo": (run or {}).get("wo") or self.e.lines[gid].get("live_wo") or "",
-             "start": _iso(_now()), "end": None, "reason": "", "by": by or "", "notes": ""}
+        wo = (run or {}).get("wo") or self.e.lines[gid].get("live_wo") or ""
+        d = {"id": uuid.uuid4().hex[:10], "line": name, "wo": wo,
+             "start": _iso(_now()), "end": None, "reason": "", "by": by or "", "notes": "", "moved": [], "failed": []}
+        tcp_note = ""
+        if self.settings.get("line_down_step") and wo:
+            if self.e.preview:
+                tcp_note = f" Preview: would move everyone on {name} to {wo}\\{self.settings['line_down_step']}."
+            else:
+                code = self.down_code(gid, wo)
+                jc = self.e.tcp.line_job_code(name)
+                d["code"] = code
+                for p in self.people(gid):
+                    if (p["costCode"] or "").upper() == code.upper():
+                        continue
+                    try:
+                        self.change_code(p["employeeId"], jc, code)
+                        d["moved"].append({"employeeId": p["employeeId"], "name": p["name"], "from": p["costCode"]})
+                    except TcpError as ex:
+                        d["failed"].append(f"{p['name']} ({ex})")
+                if d["moved"]:
+                    tcp_note = f" Moved {len(d['moved'])} people to {code} in TCP: " + ", ".join(m["name"] for m in d["moved"]) + "."
+                if d["failed"]:
+                    tcp_note += " Could not move: " + "; ".join(d["failed"]) + "."
         self.downtime.append(d)
-        self.e.note("hold", name, f"Line down on WO {d['wo']}" + (f", reported by {by}" if by else ""))
+        self.e.note("hold", name, f"Line down on WO {wo}" + (f", reported by {by}" if by else "") + "." + tcp_note)
         self.e.save()
         return d
+
+    def _back_to(self, gid: str, old: str) -> str | None:
+        """Where someone goes when the line is back up: their own step, on the WO running now."""
+        wo = self.e.lines[gid].get("live_wo")
+        if not old or not wo:
+            return None
+        if old.upper().startswith(str(wo).upper() + "\\"):
+            return old
+        try:
+            codes = [c["fullName"] for c in self.e.desired_codes(wo, None)[0]]
+        except Exception:  # noqa
+            codes = [c["fullName"] for c in self.e.tcp.wo_cost_codes(wo)[0]]
+        rest = old.split("\\", 1)[1].upper() if "\\" in old else ""
+        return next((c for c in codes if c.split("\\", 1)[1].upper() == rest), None) \
+            or next((c for c in codes if c.split("\\", 1)[1].split("\\")[0].upper() == rest.split("\\")[0]), None) \
+            or (codes[0] if codes else None)
 
     def down_end(self, gid: str, reason: str, notes: str, by: str):
         g = self._group(gid)
@@ -305,9 +375,37 @@ class Ops:
             raise ValueError(f"{name} is not down")
         if not reason:
             raise ValueError("pick a downtime reason")
+        back, left, failed = [], [], []
+        step = (self.settings.get("line_down_step") or "").upper()
+        if step and not self.e.preview:
+            jc = self.e.tcp.line_job_code(name)
+            was = {str(m["employeeId"]): m["from"] for m in d.get("moved") or []}
+            for p in self.people(gid):
+                code = (p["costCode"] or "").upper()
+                if not code.endswith("\\" + step):
+                    continue                                   # already picked their own step again
+                target = self._back_to(gid, was.get(str(p["employeeId"]), ""))
+                if not target:
+                    left.append(p["name"])                     # clocked in during line down: they pick their step
+                    continue
+                try:
+                    self.change_code(p["employeeId"], jc, target)
+                    back.append(f"{p['name']} to {target}")
+                except TcpError as ex:
+                    failed.append(f"{p['name']} ({ex})")
         d["end"], d["reason"], d["notes"] = _iso(_now()), reason, notes or ""
+        d["back"], d["left"] = back, left
+        if failed:
+            d.setdefault("failed", []).extend(failed)
         mins = round((_dt(d["end"]) - _dt(d["start"])).total_seconds() / 60)
-        self.e.note("resume", name, f"Line back up after {mins} min on WO {d['wo']}. Reason: {reason}")
+        msg = f"Line back up after {mins} min on WO {d['wo']}. Reason: {reason}."
+        if back:
+            msg += f" Back on their steps in TCP: {', '.join(back)}."
+        if left:
+            msg += f" Still on Line Down (clocked in while down, they pick their step): {', '.join(left)}."
+        if failed:
+            msg += f" Could not move back: {'; '.join(failed)}."
+        self.e.note("resume", name, msg)
         self.e.save()
         return d
 
@@ -369,6 +467,8 @@ class Ops:
     def run_report(self, r: dict, with_labor: bool = True) -> dict:
         out = dict(r)
         excl = [x.upper() for x in self.settings.get("exclude_from_cost", [])]
+        if self.settings.get("line_down_step"):
+            excl.append(self.settings["line_down_step"].upper())     # line down time is never filling cost
         rate = float(self.settings.get("labor_rate") or 0)
         if with_labor:
             try:
@@ -429,7 +529,10 @@ class Ops:
                 parts = [p for p in st.split("\\") if p][:4]
                 out.append({"level1": str(wo).upper(), **{f"level{i + 2}": v for i, v in enumerate(parts)}})
             return out
-        roles = self.settings.get("roles") or []
+        roles = list(self.settings.get("roles") or [])
+        step = (self.settings.get("line_down_step") or "").upper()
+        if step and roles and step not in roles:
+            roles.append(step)
         funcs = self.settings.get("functions") or []
         out = []
         for role in roles:
