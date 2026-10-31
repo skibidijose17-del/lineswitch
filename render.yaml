@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: lineswitch
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: TZ
+        value: America/Los_Angeles
+      - key: TCP_API_KEY
+        sync: false
+      - key: TCP_CLIENT_ID
+        sync: false
+      - key: TCP_CLIENT_SECRET
+        sync: false
+      - key: BOARD_USER
+        value: linesync
+      - key: BOARD_PASSWORD
+        sync: false

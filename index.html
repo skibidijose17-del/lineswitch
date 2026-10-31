@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LineSwitch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..900&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#E9EDF1; --panel:#FFFFFF; --ink:#16212C; --soft:#5B6977; --rule:#D3DAE1; --track:#F3F5F8;
+  --blue:#085DD4; --blue-t:#E5EEFC; --green:#0B7A5E; --green-t:#E2F3EC; --amber:#C77A00; --amber-t:#FFF1D9;
+  --red:#C73B3B; --red-t:#FBE7E7; --r:14px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{font-family:Archivo,system-ui,sans-serif;font-variation-settings:"wdth" 100;color:var(--ink);background:var(--bg)}
+body{min-height:100vh;font-size:15px;line-height:1.45}
+button,input{font:inherit;color:inherit}
+:focus-visible{outline:3px solid var(--blue);outline-offset:2px}
+.wrap{max-width:1280px;margin:0 auto;padding:0 20px}
+
+/* top bar */
+.top{background:var(--ink);color:#fff}
+.top .wrap{display:flex;align-items:center;gap:18px;min-height:64px;flex-wrap:wrap;padding-top:8px;padding-bottom:8px}
+.brand{font-weight:850;font-size:22px;font-variation-settings:"wdth" 118;letter-spacing:-.01em;display:flex;align-items:center;gap:10px}
+.brand i{display:inline-block;width:22px;height:22px;border-radius:6px;background:linear-gradient(90deg,var(--green) 0 48%,transparent 48% 52%,var(--blue) 52%)}
+.conn{font-size:13px;color:#B9C4CF;display:flex;align-items:center;gap:8px}
+.dot{width:9px;height:9px;border-radius:50%;background:#7A8794}
+.dot.ok{background:#35C48F}.dot.bad{background:#FF6B6B}
+.spacer{flex:1}
+.mode{display:flex;background:#24313E;border-radius:999px;padding:4px}
+.mode button{border:0;background:transparent;color:#B9C4CF;padding:7px 16px;border-radius:999px;font-weight:650;cursor:pointer}
+.mode button.on.pv{background:var(--amber);color:#fff}
+.mode button.on.lv{background:#18A877;color:#fff}
+.btn{border:1px solid var(--rule);background:var(--panel);border-radius:10px;padding:8px 14px;font-weight:650;cursor:pointer;font-size:14px}
+.btn:hover{border-color:#9FB0C1}
+.btn.dark{background:#24313E;border-color:#24313E;color:#fff}
+.btn.primary{background:var(--blue);border-color:var(--blue);color:#fff}
+.btn.small{padding:6px 10px;font-size:13px}
+
+/* banner */
+.banner{margin-top:16px;border-radius:var(--r);padding:12px 16px;font-size:14px;display:flex;gap:10px;align-items:center}
+.banner.pv{background:var(--amber-t);color:#6E4300}
+.banner.bad{background:var(--red-t);color:#7A1F1F}
+.banner.ok{background:var(--green-t);color:#064C3A}
+
+/* upload strip */
+.load{margin-top:16px;display:grid;grid-template-columns:1fr auto;gap:16px;align-items:stretch}
+.drop{border:2px dashed #AEBBC8;border-radius:var(--r);background:var(--panel);padding:16px 20px;display:flex;align-items:center;gap:16px;cursor:pointer;transition:border-color .15s,background .15s}
+.drop.over{border-color:var(--blue);background:var(--blue-t)}
+.drop b{font-size:16px}
+.drop small{display:block;color:var(--soft);font-size:13px}
+.drop .ic{width:42px;height:42px;border-radius:10px;background:var(--blue-t);display:grid;place-items:center;flex:none}
+.stats{display:flex;gap:10px}
+.stat{background:var(--panel);border-radius:var(--r);padding:12px 16px;min-width:120px}
+.stat b{display:block;font-size:24px;font-weight:800;font-variation-settings:"wdth" 112;font-variant-numeric:tabular-nums}
+.stat span{font-size:13px;color:var(--soft)}
+
+/* schedule check */
+.check{margin-top:16px;background:var(--panel);border-radius:18px;padding:18px 20px;border-left:6px solid var(--red)}
+.check.good{border-left-color:var(--green);padding:14px 20px}
+.check h2{font-size:17px;font-weight:750;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.check .lede{font-size:14px;color:var(--soft);margin:4px 0 10px}
+.prob{display:grid;grid-template-columns:minmax(200px,1.1fr) 1.6fr;gap:14px;padding:12px 0;border-top:1px solid var(--track);align-items:start}
+.prob .what b{font-size:15px}
+.prob .what small{display:block;color:var(--soft);font-size:13px}
+.tag{display:inline-block;font-size:12px;font-weight:650;padding:2px 8px;border-radius:999px;margin-right:6px}
+.tag.missing{background:var(--red-t);color:var(--red)}.tag.nocodes,.tag.error{background:var(--amber-t);color:var(--amber)}
+.fix{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.fix input,.fix select{border:1px solid var(--rule);border-radius:10px;padding:7px 10px;font-size:14px;min-width:170px;background:#fff}
+.fix .hint{width:100%;font-size:13px;color:var(--soft)}
+.sug{border:1px dashed #9FB0C1;background:#fff;border-radius:8px;padding:4px 9px;font-size:13px;cursor:pointer}
+.sug:hover{border-color:var(--blue);color:var(--blue)}
+.maps{font-size:13px;color:var(--soft);margin-top:8px}
+.maps button{border:0;background:none;color:var(--blue);cursor:pointer;font-size:13px;text-decoration:underline}
+@media (max-width:900px){.prob{grid-template-columns:1fr}}
+
+/* lanes: the board is the timeline */
+.board{margin-top:20px;background:var(--panel);border-radius:18px;overflow:hidden}
+.hours{display:grid;grid-template-columns:var(--lead) 1fr;border-bottom:1px solid var(--rule)}
+.hours .lbl{padding:10px 18px;font-size:13px;color:var(--soft)}
+.scale{position:relative;height:36px}
+.scale{overflow:hidden}.scale span{position:absolute;top:10px;font-size:12px;color:var(--soft);transform:translateX(-50%);font-variant-numeric:tabular-nums;white-space:nowrap}
+.lane{display:grid;grid-template-columns:var(--lead) 1fr;border-bottom:1px solid var(--rule)}
+.lane:last-child{border-bottom:0}
+.lead{padding:16px 18px;border-right:1px solid var(--rule);display:flex;flex-direction:column;gap:8px}
+.lname{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;justify-content:space-between}
+.state{font-size:12px;font-weight:650;padding:3px 9px;border-radius:999px;white-space:nowrap}
+.state.live{background:var(--green-t);color:var(--green)}
+.state.prev{background:var(--amber-t);color:var(--amber)}
+.state.hold{background:var(--amber);color:#fff}
+.state.err{background:var(--red-t);color:var(--red)}
+.state.idle{background:var(--track);color:var(--soft)}
+.wo{font-size:40px;line-height:1;font-weight:880;font-variation-settings:"wdth" 122;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.wo.none{color:#AFBAC5;font-size:28px}
+.sub{font-size:13px;color:var(--soft)}
+.next{font-size:13px}
+.next b{font-variant-numeric:tabular-nums}
+.act{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto}
+.act input{width:108px;border:1px solid var(--rule);border-radius:10px;padding:6px 10px;font-size:13px}
+.right{position:relative;padding:14px 0 0;display:flex;flex-direction:column;gap:12px}
+.codes{display:flex;gap:6px;flex-wrap:wrap;padding:0 18px;min-height:28px;align-items:center}
+.codes .lab{font-size:13px;color:var(--soft);margin-right:4px}
+.chip{background:var(--blue-t);color:#0B3E8F;border-radius:8px;padding:4px 9px;font-size:13px;font-weight:600}
+.chip.empty{background:var(--track);color:var(--soft);font-weight:500}
+.err-text{margin:0 18px;font-size:13px;color:var(--red);background:var(--red-t);border-radius:8px;padding:6px 10px}
+.track{position:relative;flex:1;min-height:84px;background:repeating-linear-gradient(90deg,transparent 0 calc(var(--hw) - 1px),var(--rule) calc(var(--hw) - 1px) var(--hw));background-color:var(--track)}
+.blk{position:absolute;top:14px;bottom:14px;border-radius:9px;background:#C8D7EC;color:#0B3E8F;padding:7px 10px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:12px;line-height:1.3;border:0;text-align:left;cursor:pointer;min-width:6px}
+.blk b{overflow:hidden;text-overflow:ellipsis}
+.blk b{display:block;font-size:14px;font-weight:800;font-variation-settings:"wdth" 112}
+.blk.cur{background:var(--green);color:#fff}
+.blk.past{background:#DCE2E8;color:#7A8794}
+.nowline{position:absolute;top:0;bottom:0;width:2px;background:var(--red);z-index:3;pointer-events:none}
+.nowline::before{content:"";position:absolute;top:-1px;left:-4px;width:10px;height:10px;border-radius:50%;background:var(--red)}
+.empty-board{padding:40px 24px;text-align:center;color:var(--soft)}
+.empty-board b{display:block;color:var(--ink);font-size:18px;margin-bottom:6px}
+
+/* lower */
+.lower{display:grid;grid-template-columns:1.4fr 1fr;gap:20px;margin:20px 0 40px}
+.card{background:var(--panel);border-radius:18px;padding:18px 20px}
+.card h2{font-size:17px;font-weight:750;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.feed{list-style:none;max-height:420px;overflow:auto}
+.feed li{display:grid;grid-template-columns:108px 1fr;gap:10px;padding:9px 0;border-top:1px solid var(--track);font-size:13.5px}
+.feed time{color:var(--soft);font-variant-numeric:tabular-nums}
+.feed .k{font-weight:700;margin-right:6px}
+.k-map{color:var(--blue)}.k-switch{color:var(--green)}.k-preview{color:var(--amber)}.k-error{color:var(--red)}
+.grp{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 0;border-top:1px solid var(--track);font-size:14px}
+.grp small{display:block;color:var(--soft);font-size:12.5px}
+.note{font-size:13px;color:var(--soft);margin-bottom:10px}
+
+/* drawer */
+.drawer{position:fixed;inset:0 0 0 auto;width:min(760px,100%);background:#0F1A24;color:#DCE6EF;transform:translateX(100%);transition:transform .2s ease;z-index:20;display:flex;flex-direction:column}
+.drawer.open{transform:none}
+.drawer header{display:flex;gap:8px;align-items:center;padding:14px 18px;border-bottom:1px solid #243444;flex-wrap:wrap}
+.drawer header b{font-size:16px;margin-right:auto}
+.drawer pre{flex:1;overflow:auto;padding:16px 18px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+.drawer .btn{background:#1C2A38;border-color:#2B3D4F;color:#DCE6EF}
+.scrim{position:fixed;inset:0;background:rgba(10,20,30,.35);z-index:19;display:none}
+.scrim.open{display:block}
+
+/* modal */
+.modal{position:fixed;inset:0;display:none;place-items:center;z-index:30;background:rgba(10,20,30,.4);padding:16px}
+.modal.open{display:grid}
+.modal .box{background:var(--panel);border-radius:18px;padding:22px;width:min(460px,100%)}
+.modal h3{font-size:18px;margin-bottom:6px}
+.modal p{color:var(--soft);font-size:14px;margin-bottom:12px}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--ink);color:#fff;padding:12px 18px;border-radius:12px;font-size:14px;z-index:40;display:none;max-width:min(680px,92vw)}
+.toast.show{display:block}
+
+@media (max-width:900px){
+  .load{grid-template-columns:1fr}
+  .stats{flex-wrap:wrap}
+  .lower{grid-template-columns:1fr}
+  .lane,.hours{grid-template-columns:1fr}
+  .hours .lbl{display:none}
+  .lead{border-right:0;border-bottom:1px solid var(--track)}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="top"><div class="wrap">
+  <div class="brand"><i aria-hidden="true"></i>LineSwitch</div>
+  <div class="conn"><span class="dot" id="dot"></span><span id="conn">Connecting to TCP</span></div>
+  <div class="spacer"></div>
+  <div class="mode" role="group" aria-label="Mode">
+    <button id="mPreview" class="pv" onclick="setMode(true)">Preview</button>
+    <button id="mLive" class="lv" onclick="setMode(false)">Live</button>
+  </div>
+  <button class="btn dark small" onclick="sync()">Sync with TCP</button>
+  <button class="btn dark small" onclick="openLog()">API log</button>
+</div></div>
+
+<main class="wrap">
+  <div id="banner"></div>
+
+  <section class="load">
+    <label class="drop" id="drop" tabindex="0">
+      <span class="ic" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#085DD4" stroke-width="2.2" stroke-linecap="round"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></svg></span>
+      <span><b>Upload the production schedule</b>
+        <small id="fileinfo">Drop an Excel or CSV file here, or click to choose. Columns: Line, Work Order, Start, End.</small></span>
+      <input type="file" id="file" accept=".xlsx,.xlsm,.csv" hidden>
+    </label>
+    <div class="stats">
+      <div class="stat"><b id="sLines">0</b><span>lines</span></div>
+      <div class="stat"><b id="sWos">0</b><span>work orders ahead</span></div>
+      <div class="stat"><b id="sNext">none</b><span id="sNextL">next switch</span></div>
+    </div>
+  </section>
+
+  <section id="check"></section>
+
+  <section class="board" id="board" style="--lead:330px"></section>
+
+  <section class="lower">
+    <div class="card">
+      <h2>Activity <button class="btn small" onclick="clearSchedule()">Clear schedule</button></h2>
+      <ul class="feed" id="feed"></ul>
+    </div>
+    <div class="card">
+      <h2>Cost code groups in TCP</h2>
+      <p class="note">Each group used as a line is attached to a clock configuration, and so to a kiosk. Groups tied to job codes are left alone; they keep each work order's cost codes for reports.</p>
+      <div id="groups"></div>
+      <p class="note" style="margin-top:14px">Need a starting file? <a href="/api/sample">Download a schedule template</a> made from your lines.</p>
+    </div>
+  </section>
+</main>
+
+<div class="scrim" id="scrim" onclick="closeLog()"></div>
+<aside class="drawer" id="drawer" aria-label="API log">
+  <header><b>Every call to TCP</b>
+    <button class="btn small" onclick="loadLog(0)">All</button>
+    <button class="btn small" onclick="loadLog(1)">Only errors</button>
+    <button class="btn small" onclick="copyLog()">Copy</button>
+    <button class="btn small" onclick="clearLog()">Clear</button>
+    <button class="btn small" onclick="closeLog()">Close</button></header>
+  <pre id="logtext">Loading</pre>
+</aside>
+
+<div class="modal" id="modal"><div class="box">
+  <h3 id="mTitle">Switch line</h3>
+  <p id="mText">Type the work order to put on this line now. It stays until you press Follow schedule.</p>
+  <input id="mWo" class="btn" style="width:100%;text-align:left;font-weight:500" placeholder="Work order number">
+  <div id="mPreviewCodes" class="note" style="margin-top:10px"></div>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+    <button class="btn" onclick="closeModal()">Cancel</button>
+    <button class="btn" onclick="checkWo()">Check cost codes</button>
+    <button class="btn primary" onclick="doSwitch()">Switch line</button>
+  </div>
+</div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+let S=null, logErrors=0, modalLine=null;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const hm=iso=>new Date(iso).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"});
+function toast(t){const e=$("toast");e.textContent=t;e.classList.add("show");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove("show"),5200)}
+async function api(path,opt={}){const r=await fetch(path,opt);let j=null;try{j=await r.json()}catch(e){}
+  if(!r.ok){throw new Error((j&&(j.message||j.detail))||("Request failed "+r.status))}return j}
+
+async function load(){try{S=await api("/api/state");render()}catch(e){toast(e.message)}}
+function codeName(c){return c.fullName||c.description||c.id}
+
+function render(){
+  const pv=S.preview;
+  $("mPreview").classList.toggle("on",pv);$("mLive").classList.toggle("on",!pv);
+  const ok=S.configured&&!S.tcp_error;
+  $("dot").className="dot "+(ok?"ok":"bad");
+  $("conn").textContent=!S.configured?"TCP keys not set":S.tcp_error?"TCP problem":"Connected to TCP, company "+S.company+(S.last_sync?", synced "+hm(S.last_sync):"");
+  let b="";
+  if(!S.configured)b=`<div class="banner bad">Add TCP_API_KEY, TCP_CLIENT_ID and TCP_CLIENT_SECRET on Render, then redeploy.</div>`;
+  else if(S.tcp_error)b=`<div class="banner bad">TCP answered with a problem: ${esc(S.tcp_error)}. Open the API log to see the full reply.</div>`;
+  else if(pv)b=`<div class="banner pv"><b>Preview mode.</b> LineSwitch shows what it would change, and changes nothing in TCP. Switch to Live when the preview looks right.</div>`;
+
+  $("banner").innerHTML=b;
+
+  const lines=S.lines.filter(l=>l.is_line);
+  $("sLines").textContent=lines.length;$("sWos").textContent=S.upcoming;
+  const nexts=lines.filter(l=>l.next&&!l.hold&&!l.override).map(l=>({t:new Date(l.next.start),l}));
+  nexts.sort((a,b)=>a.t-b.t);
+  if(nexts.length){const n=nexts[0];$("sNext").textContent=hm(n.t);$("sNextL").textContent=`${n.l.name} to WO ${n.l.next.wo}`}
+  else{$("sNext").textContent="none";$("sNextL").textContent="next switch"}
+  $("fileinfo").textContent=S.schedule_file?`${S.schedule_file} is loaded, ${S.schedule_count} work orders. Drop a new file to replace those lines.`:"Drop an Excel or CSV file here, or click to choose. Columns: Line, Work Order, Start, End.";
+  renderBoard(lines);renderFeed();renderGroups();renderCheck();
+}
+
+function renderBoard(lines){
+  const now=new Date(S.now);
+  // a 24 hour window from 6 hours ago, so tonight's work orders are never cut off at midnight
+  const start=new Date(now);start.setMinutes(0,0,0);start.setHours(start.getHours()-6);
+  const span=24*3600e3;const pos=d=>Math.max(0,Math.min(100,(new Date(d)-start)/span*100));
+  if(!lines.length){$("board").innerHTML=`<div class="empty-board"><b>No lines yet</b>${S.configured?"LineSwitch makes one line for each cost code group in TCP that is not tied to a job code. Create a group like \"Line 1\", attach it to the Line 1 clock configuration, then press Sync with TCP.":"Connect TCP first."}</div>`;return}
+  let h=`<div class="hours"><div class="lbl">${now.toLocaleDateString([], {weekday:"long",month:"short",day:"numeric"})}, next 18 hours</div><div class="scale">`;
+  for(let i=1;i<24;i+=2){const d=new Date(start.getTime()+i*3600e3);const hr=d.getHours();
+    h+=`<span style="left:${i/24*100}%">${hr===0?"12a":hr<12?hr+"a":hr===12?"12p":(hr-12)+"p"}</span>`}
+  h+=`</div></div>`;
+  for(const l of lines){
+    let st=`<span class="state idle">Waiting</span>`;
+    if(l.error)st=`<span class="state err">Needs attention</span>`;
+    else if(l.hold)st=`<span class="state hold">Paused</span>`;
+    else if(l.override)st=`<span class="state prev">Set by hand</span>`;
+    else if(l.live_wo&&l.mode==="live")st=`<span class="state live">Live in TCP</span>`;
+    else if(l.live_wo)st=`<span class="state prev">Preview</span>`;
+    const sched=l.now?`Schedule: WO ${esc(l.now.wo)} until ${hm(l.now.end)}`:"No work order scheduled right now";
+    const nx=l.next?`<div class="next">Next <b>WO ${esc(l.next.wo)}</b> at <b>${hm(l.next.start)}</b></div>`:`<div class="next sub">Nothing else scheduled</div>`;
+    const codes=l.codes.length?l.codes.map(c=>`<span class="chip">${esc(codeName(c))}</span>`).join(""):`<span class="chip empty">Group is empty</span>`;
+    let blocks="";
+    for(const r of l.rows){const a=pos(r.start),z=pos(r.end);if(z<=0||a>=100)continue;
+      const cls=new Date(r.end)<=now?"past":(new Date(r.start)<=now?"cur":"");
+      blocks+=`<button class="blk ${cls}" style="left:${a}%;width:${Math.max(.6,z-a)}%" title="WO ${esc(r.wo)} ${hm(r.start)} to ${hm(r.end)}${r.note?" "+esc(r.note):""}" onclick="openModal('${l.id}','${esc(r.wo)}')"><b>${esc(r.wo)}</b>${hm(r.start)} to ${hm(r.end)}</button>`}
+    h+=`<div class="lane"><div class="lead">
+        <div class="lname">${esc(l.name)} ${st}</div>
+        <div class="wo ${l.live_wo?"":"none"}">${l.live_wo?esc(l.live_wo):"No WO yet"}</div>
+        <div class="sub">${sched}</div>${nx}
+        <div class="act">
+          <button class="btn small primary" onclick="openModal('${l.id}')">Switch WO</button>
+          ${l.hold||l.override?`<button class="btn small" onclick="lineAct('${l.id}','resume')">Follow schedule</button>`:`<button class="btn small" onclick="lineAct('${l.id}','hold')">Pause</button>`}
+        </div></div>
+      <div class="right">
+        <div class="codes"><span class="lab">In this group now:</span>${codes}</div>
+        ${l.error?`<div class="err-text">${esc(l.error)}</div>`:""}
+        <div class="track" style="--hw:${100/24}%">${blocks}<div class="nowline" style="left:${pos(now)}%"></div></div>
+      </div></div>`;
+  }
+  $("board").innerHTML=h;
+}
+
+function renderCheck(){
+  const el=$("check");
+  if(!S.wo_total&&!(S.problems||[]).length){el.innerHTML="";return}
+  const probs=S.problems||[];
+  const maps=Object.entries(S.wo_map||{}).map(([a,b])=>`WO ${esc(a)} uses TCP job code ${esc(b)} <button onclick="mapWo('${esc(a)}','')">undo</button>`)
+    .concat(Object.entries(S.line_map||{}).map(([a,b])=>`line "${esc(a)}" uses group ${esc(b)}`));
+  const mapsHtml=maps.length?`<div class="maps">Your mappings: ${maps.join("; ")}</div>`:"";
+  if(!probs.length){
+    el.innerHTML=`<div class="check good"><h2>Schedule check passed <button class="btn small" onclick="revalidate()">Check again</button></h2>
+      <div class="lede" style="margin:2px 0 0">${S.ok_count} of ${S.wo_total} work orders were found in TCP with their cost codes, and every line matches a cost code group.</div>${mapsHtml}</div>`;return}
+  const opts=S.group_names.map(g=>`<option value="${esc(g.id)}">${esc(g.name)}</option>`).join("");
+  let h=`<div class="check"><h2>Schedule check: ${probs.length} ${probs.length===1?"item needs":"items need"} attention <button class="btn small" onclick="revalidate()">Check again</button></h2>
+    <div class="lede">These lines will not switch until each item is fixed. Map it to what TCP calls it, or fix it in TCP and press Check again.</div>`;
+  for(const p of probs){
+    const id="f_"+btoa(unescape(encodeURIComponent(p.type+p.key))).replace(/[^a-z0-9]/gi,"");
+    if(p.type==="line"){
+      h+=`<div class="prob"><div class="what"><span class="tag missing">Line not found</span><b>${esc(p.key)}</b><small>${esc(p.message)}</small></div>
+        <div class="fix"><select id="${id}"><option value="">Pick the cost code group</option>${opts}</select>
+        <button class="btn small primary" onclick="mapLine('${esc(p.key)}',$('${id}').value)">Map line</button>
+        <span class="hint">Or rename the line in the file to match the group name exactly.</span></div></div>`;
+    }else{
+      const label=p.status==="missing"?"Work order not found":p.status==="nocodes"?"No cost codes":"Could not check";
+      const sug=(p.suggestions||[]).map(x=>`<button class="sug" onclick="mapWo('${esc(p.key)}','${esc(x.id)}')">${esc(x.id)} ${esc(x.description)}</button>`).join("");
+      const hint=p.status==="nocodes"?"In TCP, attach a cost code group with this work order's cost codes to the job code, then press Check again. Or map it to a job code that has them.":
+        p.status==="missing"?(sug?"Did you mean one of these?":"Type the job code number this work order has in TCP."):"";
+      h+=`<div class="prob"><div class="what"><span class="tag ${esc(p.status)}">${label}</span><b>WO ${esc(p.key)}</b>
+          <small>${esc(p.message)}${p.lines&&p.lines.length?`. Used on ${p.lines.map(esc).join(", ")}`:""}${p.mapped?`. Currently mapped to ${esc(p.tcp)}`:""}</small></div>
+        <div class="fix"><input id="${id}" placeholder="TCP job code" value="${p.mapped?esc(p.tcp):""}">
+          <button class="btn small primary" onclick="mapWo('${esc(p.key)}',$('${id}').value)">Map work order</button>
+          ${p.mapped?`<button class="btn small" onclick="mapWo('${esc(p.key)}','')">Remove mapping</button>`:""}
+          <span class="hint">${hint}</span>${sug}</div></div>`;
+    }
+  }
+  el.innerHTML=h+mapsHtml+`</div>`;
+}
+async function mapWo(wo,tcpId){S=await api("/api/map/wo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({wo,tcp:String(tcpId||"").trim()})});render();
+  const p=(S.problems||[]).find(x=>x.type==="wo"&&x.key===wo);toast(p?`WO ${wo}: ${p.message}`:(tcpId?`WO ${wo} now uses TCP job code ${tcpId}`:`Mapping for WO ${wo} removed`))}
+async function mapLine(line,gid){if(!gid){toast("Pick a cost code group first");return}
+  S=await api("/api/map/line",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({line,group:gid})});render();toast(`${line} is now mapped`)}
+async function revalidate(){toast("Checking every work order in TCP");S=await api("/api/validate",{method:"POST"});render();
+  toast((S.problems||[]).length?`${S.problems.length} items still need attention`:"Everything matches TCP")}
+
+function renderFeed(){
+  $("feed").innerHTML=S.activity.length?S.activity.map(a=>`<li><time>${esc(a.time)}</time><span><span class="k k-${esc(a.kind)}">${esc(a.line)}</span>${esc(a.text)}</span></li>`).join(""):`<li><span></span><span class="sub">Nothing yet. Upload a schedule to start.</span></li>`;
+}
+function renderGroups(){
+  $("groups").innerHTML=S.lines.length?S.lines.map(l=>`<div class="grp"><span><b>${esc(l.name)}</b><small>${l.is_line?"Used as a line":"Not a line"}${l.jobCodeAssignments?`, tied to ${l.jobCodeAssignments} job code${l.jobCodeAssignments>1?"s":""}`:""}</small></span>
+    <button class="btn small" onclick="lineAct('${l.id}','toggle')">${l.is_line?"Stop using as line":"Use as line"}</button></div>`).join(""):`<p class="note">No cost code groups found yet.</p>`;
+}
+
+async function setMode(on){
+  if(!on&&!confirmLive())return;
+  S=await api("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({on})});render();
+  toast(on?"Preview mode on. Nothing changes in TCP.":"Live mode on. LineSwitch now updates the cost code groups in TCP.")}
+function confirmLive(){return window.confirm("Go live? LineSwitch will start changing the cost code groups in TCP on schedule.")}
+async function sync(){toast("Syncing with TCP");S=await api("/api/refresh",{method:"POST"});render();toast("Synced")}
+async function lineAct(id,a){S=await api(`/api/lines/${id}/${a}`,{method:"POST"});render()}
+async function clearSchedule(){if(!confirm("Clear the whole schedule? Lines keep their current work order."))return;S=await api("/api/schedule",{method:"DELETE"});render()}
+
+function openModal(id,wo=""){modalLine=id;const l=S.lines.find(x=>x.id===id);$("mTitle").textContent="Switch "+l.name;$("mWo").value=wo;$("mPreviewCodes").textContent="";$("modal").classList.add("open");$("mWo").focus()}
+function closeModal(){$("modal").classList.remove("open")}
+async function checkWo(){const wo=$("mWo").value.trim();if(!wo)return;$("mPreviewCodes").textContent="Asking TCP";
+  const r=await api("/api/wo/"+encodeURIComponent(wo));
+  $("mPreviewCodes").innerHTML=r.ok?`WO ${esc(wo)} brings these cost codes: <b>${r.codes.map(c=>esc(codeName(c))).join(", ")||"none"}</b> (from ${r.groups.map(esc).join(", ")||"no group"})`:`<span style="color:var(--red)">${esc(r.message)}</span>`}
+async function doSwitch(){const wo=$("mWo").value.trim();if(!wo)return;
+  try{S=await api(`/api/lines/${modalLine}/switch`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({wo})});closeModal();render();
+  const l=S.lines.find(x=>x.id===modalLine);toast(l.error?l.error:(S.preview?`Preview: ${l.name} would switch to WO ${wo}. See Activity.`:`${l.name} switched to WO ${wo}`))}catch(e){toast(e.message)}}
+$("mWo").addEventListener("keydown",e=>{if(e.key==="Enter")doSwitch();if(e.key==="Escape")closeModal()});
+
+const drop=$("drop"),file=$("file");
+drop.addEventListener("click",()=>file.click());
+drop.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();file.click()}});
+["dragenter","dragover"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("over")}));
+["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove("over")}));
+drop.addEventListener("drop",e=>{if(e.dataTransfer.files[0])upload(e.dataTransfer.files[0])});
+file.addEventListener("change",()=>{if(file.files[0])upload(file.files[0]);file.value=""});
+async function upload(f){const fd=new FormData();fd.append("file",f);toast("Loading "+f.name);
+  try{const r=await api("/api/schedule",{method:"POST",body:fd});S=r.state;render();toast(r.message)}catch(e){toast(e.message);load()}}
+
+function openLog(){$("drawer").classList.add("open");$("scrim").classList.add("open");loadLog(logErrors)}
+function closeLog(){$("drawer").classList.remove("open");$("scrim").classList.remove("open")}
+function pretty(x){if(x===null||x===undefined||x===""||(typeof x==="object"&&!Object.keys(x).length))return"none";
+  if(typeof x==="string"){try{return JSON.stringify(JSON.parse(x),null,2)}catch(e){return x}}return JSON.stringify(x,null,2)}
+async function loadLog(err){logErrors=err;const rows=await api("/api/apilog?errors="+err);
+  $("logtext").textContent=rows.length?rows.map(r=>`=== ${r.time}  ${r.method} ${r.path}  ->  ${r.status}  (${r.ms} ms)\n--- query: ${pretty(r.params)}\n--- sent: ${pretty(r.body)}\n--- TCP answered:\n${pretty(r.response)}\n`).join("\n"):"No calls yet."}
+function copyLog(){navigator.clipboard.writeText($("logtext").textContent).then(()=>toast("API log copied"))}
+async function clearLog(){await api("/api/apilog",{method:"DELETE"});loadLog(logErrors)}
+document.addEventListener("keydown",e=>{if(e.key==="Escape"){closeLog();closeModal()}});
+
+load();setInterval(load,15000);
+</script>
+</body>
+</html>
