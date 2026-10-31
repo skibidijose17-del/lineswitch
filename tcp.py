@@ -16,7 +16,7 @@ import collections
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import requests
@@ -193,6 +193,63 @@ class Tcp:
                     seen.add(k)
                     codes.append(c)
         return codes, groups
+
+    # ------------------------------------------------------------ people on a line
+    @staticmethod
+    def stamp(dt: datetime | None = None) -> str:
+        """TCP wants yyyy-MM-ddTHH:mm:ssK (with the UTC offset)."""
+        return (dt or datetime.now()).astimezone().replace(microsecond=0).isoformat()
+
+    def line_job_code(self, group_description: str) -> str | None:
+        """The job code a line group is attached to (LINE 1 = 901). Cached for 10 minutes."""
+        now = time.time()
+        if not getattr(self, "_jc_cache", None) or now - self._jc_at > 600:
+            self._jc_cache = self.get_all("/jobcodes")
+            self._jc_at = now
+        for j in self._jc_cache:
+            for g in j.get("costCodeGroups") or []:
+                name = g.get("description") if isinstance(g, dict) else str(g)
+                if str(name).strip().lower() == group_description.strip().lower():
+                    return str(j.get("jobCodeId"))
+        return None
+
+    def segments(self, start: datetime, stop: datetime, job_code: str | None = None) -> list[dict]:
+        p = {"startDate": self.stamp(start), "stopDate": self.stamp(stop)}
+        if job_code:
+            p["jobCodeIds"] = str(job_code)
+        return self.get_all("/worksegments", p)
+
+    def on_line(self, job_code: str) -> list[dict]:
+        """Workers clocked in on a line right now: today's segments on its job code with no time out."""
+        now = datetime.now()
+        rows = self.segments(now.replace(hour=0, minute=0, second=0) - timedelta(hours=12), now, job_code)
+        return [r for r in rows if not r.get("timeOut")]
+
+    def employees(self) -> dict:
+        """employeeId -> name. Cached for 30 minutes."""
+        now = time.time()
+        if getattr(self, "_emp_cache", None) is None or now - self._emp_at > 1800:
+            out = {}
+            try:
+                for e in self.get_all("/employees"):
+                    eid = str(e.get("employeeId") or e.get("id") or "")
+                    nm = " ".join(str(e.get(k) or "") for k in ("firstName", "lastName")).strip()
+                    out[eid] = nm or eid
+            except TcpError:
+                pass
+            self._emp_cache, self._emp_at = out, now
+        return self._emp_cache
+
+    def punch(self, rows: list[dict]):
+        """POST /v1/punches. Each row needs operationType and employeeId (changeCostCode, clockOut, ...)."""
+        return self.req("POST", "/punches", body=rows)
+
+    def create_cost_codes(self, codes: list[dict]):
+        """POST /v1/costcodes with [{level1, level2, level3, description, isActive, scheduleOrg}]."""
+        return self.req("POST", "/costcodes", body=codes)
+
+    def drop_code_cache(self):
+        self._codes_cache = None
 
     # ------------------------------------------------------------ write
     def ref(self, c: dict) -> str:
