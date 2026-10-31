@@ -197,8 +197,13 @@ class Tcp:
     # ------------------------------------------------------------ people on a line
     @staticmethod
     def stamp(dt: datetime | None = None) -> str:
-        """TCP wants yyyy-MM-ddTHH:mm:ssK (with the UTC offset)."""
-        return (dt or datetime.now()).astimezone().replace(microsecond=0).isoformat()
+        """Company local wall time with no offset, like 2026-10-31T09:57:00.
+        TCP turns a time with an offset into UTC and then stores that as local time (a 09:57-07:00 punch was saved at 4:57 PM),
+        so LineSwitch sends local time as is. The server's TZ must be the company's time zone (render.yaml sets it)."""
+        d = dt or datetime.now()
+        if d.tzinfo is not None:
+            d = d.astimezone().replace(tzinfo=None)
+        return d.replace(microsecond=0).isoformat()
 
     def line_job_code(self, group_description: str) -> str | None:
         """The job code a line group is attached to (LINE 1 = 901). Cached for 10 minutes."""
@@ -256,6 +261,18 @@ class Tcp:
         return c.get(self.code_ref) or c.get("fullName") or c.get("id")
 
     def swap_group(self, group: dict, remove: list[dict], add: list[dict]):
+        try:
+            return self._swap(group, remove, add)
+        except TcpError as ex:
+            if "already assigned" not in str(ex) and "not assigned" not in str(ex):
+                raise
+            # someone else changed the group a moment ago: only send what is still needed
+            have = {str(c.get("fullName", "")).lower() for c in self.group_codes(group["description"])}
+            add = [c for c in add if str(c.get("fullName", "")).lower() not in have]
+            remove = [c for c in remove if str(c.get("fullName", "")).lower() in have]
+            return self._swap(group, remove, add) if (add or remove) else None
+
+    def _swap(self, group: dict, remove: list[dict], add: list[dict]):
         body = {"description": group["description"]}
         if remove:
             body["removeCostCodes"] = [self.ref(c) for c in remove]
