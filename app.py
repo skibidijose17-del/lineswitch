@@ -363,11 +363,14 @@ def line_move(gid: str):
         wo = ln.get("live_wo")
         if not wo:
             raise ValueError("this line has no work order yet")
-        moved = []
-        for p in engine.ops.people(gid):
-            old = (p["costCode"] or "").split("\\")[0]
-            if old and old != wo:
-                moved += engine.ops.move_workers(gid, old, wo)
+        moved, fails = [], []
+        olds = {(p["costCode"] or "").split("\\")[0] for p in engine.ops.people(gid)}
+        for old in sorted(o for o in olds if o and o != wo):
+            moved += engine.ops.move_workers(gid, old, wo)
+            fails += engine.ops.last_failed
+        if fails and not moved:
+            raise ValueError("TCP would not move: " + "; ".join(fails))
+        engine.tidy(gid)
         engine.note("switch", engine.groups.get(gid, {}).get("description", gid), f"Moved {len(moved)} people to WO {wo}" + (": " + ", ".join(moved) if moved else ""))
         engine.save()
         return moved
