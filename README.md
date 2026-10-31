@@ -30,3 +30,22 @@ then Save the line. Overlapping times are refused with a clear message. Saved ch
 Optional TCP_WO_SOURCE: level1 (default, as above) or jobcode (old model: WO = job code, its cost codes come from the groups attached to that job code).
 
 Without DATABASE_URL the state falls back to state.json, which Render wipes on each redeploy.
+
+## Floor features (new)
+
+**Line tablet** (`#tablet`): put it on a tablet at each line. Pick the line once and type your name.
+* Start a work order: shows that line's work orders for today from the schedule.
+* Line down / Line back up: records downtime with a reason code.
+* End work order / End shift: clocks everyone on that line off in TCP.
+
+**Work orders** (`#orders`): every run with labor hours by step, labor cost, units planned, accepted and used, cost per unit and downtime. Also a By SO-SKU rollup, a Downtime log and a CSV export.
+
+**Setup, How the floor works**:
+* Setup starts each work order: lines wait for the setup person instead of switching on schedule times.
+* Move people when a line switches: clocked in workers move to the same step on the new WO.
+* Create missing cost codes in TCP: builds WO\STEP (and WO\FILLING\POSITION) from the step list.
+* Labor rate, steps left out of unit cost, downtime reasons.
+
+**Schedule file columns**: Line, Work Order, Start, End, SO-SKU, SKU, SKU Description, Production Units, Workers Assigned, Note.
+
+**Areas**: any cost code group named Line N, Pre-Weigh, Compounding or Area N is treated as a line.
