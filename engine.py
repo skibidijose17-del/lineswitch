@@ -16,14 +16,15 @@ import logging
 import os
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from store import Store
 from tcp import Tcp, TcpError
 
 log = logging.getLogger("lineswitch")
-STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
 
 def norm(s) -> str:
@@ -39,6 +40,7 @@ class Row:
     end: datetime
     codes: list[str] = field(default_factory=list)   # optional: cost codes listed in the file
     note: str = ""
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
 
     def covers(self, t: datetime) -> bool:
         return self.start <= t < self.end
@@ -51,7 +53,7 @@ class Row:
     @staticmethod
     def from_json(d):
         return Row(d["line"], d["wo"], datetime.fromisoformat(d["start"]), datetime.fromisoformat(d["end"]),
-                   d.get("codes") or [], d.get("note", ""))
+                   d.get("codes") or [], d.get("note", ""), d.get("id") or uuid.uuid4().hex[:10])
 
 
 HEAD = {
@@ -119,11 +121,16 @@ def parse_schedule(name: str, data: bytes) -> list[Row]:
             wo = wo[:-2]
         codes = [c.strip() for c in str(r.get("codes") or "").replace(";", ",").split(",") if c.strip()]
         rows.append(Row(str(r["line"]).strip(), wo, start, end, codes, str(r.get("note") or "").strip()))
+    check_overlaps(rows)
+    return rows
+
+
+def check_overlaps(rows: list[Row]):
     rows.sort(key=lambda x: (norm(x.line), x.start))
     for a, b in zip(rows, rows[1:]):
         if norm(a.line) == norm(b.line) and b.start < a.end:
-            raise ScheduleError(f"{a.line}: WO {a.wo} and WO {b.wo} overlap ({a.start:%H:%M} to {a.end:%H:%M} and {b.start:%H:%M})")
-    return rows
+            raise ScheduleError(f"{a.line}: WO {a.wo} ({a.start:%b %d %I:%M %p} to {a.end:%I:%M %p}) and WO {b.wo} "
+                                f"(starts {b.start:%I:%M %p}) overlap. Move one of them so they don't share time.")
 
 
 # ---------------------------------------------------------------- engine
@@ -142,30 +149,125 @@ class Engine:
         self.wo_map: dict[str, str] = {}      # WO as written in the schedule -> TCP job code id
         self.line_map: dict[str, str] = {}    # normalized line name in the schedule -> cost code group id
         self.checks: dict[str, dict] = {}     # schedule WO -> {status, tcp, codes, groups, message, suggestions}
+        self.schedule_updated = ""            # when the schedule last changed, and how
+        self.store = Store()
         self._load()
 
-    # ---------------- persistence (plain JSON file, no database)
+    # ---------------- persistence (Neon Postgres when DATABASE_URL is set, else state.json)
     def _load(self):
-        if STATE_FILE.exists():
-            try:
-                s = json.loads(STATE_FILE.read_text())
-                self.schedule = [Row.from_json(r) for r in s.get("schedule", [])]
-                self.lines = s.get("lines", {})
-                self.preview = s.get("preview", True)
-                self.activity = s.get("activity", [])[:300]
-                self.schedule_file = s.get("schedule_file", "")
-                self.wo_map = s.get("wo_map", {})
-                self.line_map = s.get("line_map", {})
-                self.checks = s.get("checks", {})
-            except Exception as e:  # noqa
-                log.warning("state file unreadable: %s", e)
+        s = self.store.load()
+        if not s:
+            return
+        try:
+            self.schedule = [Row.from_json(r) for r in s.get("schedule", [])]
+            self.lines = s.get("lines", {})
+            self.preview = s.get("preview", True)
+            self.activity = s.get("activity", [])[:300]
+            self.schedule_file = s.get("schedule_file", "")
+            self.wo_map = s.get("wo_map", {})
+            self.line_map = s.get("line_map", {})
+            self.checks = s.get("checks", {})
+            self.schedule_updated = s.get("schedule_updated", "")
+        except Exception as e:  # noqa
+            log.warning("saved state unreadable: %s", e)
 
     def save(self):
         with self.lock:
-            STATE_FILE.write_text(json.dumps({"schedule": [r.to_json() for r in self.schedule], "lines": self.lines,
-                                              "preview": self.preview, "activity": self.activity[:300],
-                                              "schedule_file": self.schedule_file, "wo_map": self.wo_map,
-                                              "line_map": self.line_map, "checks": self.checks}, default=str))
+            self.store.save({"schedule": [r.to_json() for r in self.schedule], "lines": self.lines,
+                             "preview": self.preview, "activity": self.activity[:300],
+                             "schedule_file": self.schedule_file, "wo_map": self.wo_map,
+                             "line_map": self.line_map, "checks": self.checks,
+                             "schedule_updated": self.schedule_updated})
+
+    def version(self, reason: str):
+        self.store.version([r.to_json() for r in self.schedule], reason)
+
+    # ---------------- editing the schedule in the app
+    @staticmethod
+    def _row_from(d: dict, keep_id: str | None = None) -> Row:
+        line, wo = str(d.get("line") or "").strip(), str(d.get("wo") or "").strip()
+        if not line:
+            raise ScheduleError("pick a line")
+        if not wo:
+            raise ScheduleError("type a work order number")
+        try:
+            start, end = datetime.fromisoformat(str(d["start"])), datetime.fromisoformat(str(d["end"]))
+        except Exception:  # noqa
+            raise ScheduleError("start and end need a date and a time")
+        if end <= start:
+            end += timedelta(days=1)                       # 10 PM to 2 AM
+        if end - start > timedelta(hours=48):
+            raise ScheduleError("a work order can run 48 hours at most")
+        codes = d.get("codes") or []
+        if isinstance(codes, str):
+            codes = [c.strip() for c in codes.replace(";", ",").split(",") if c.strip()]
+        r = Row(line, wo, start.replace(second=0, microsecond=0), end.replace(second=0, microsecond=0), codes, str(d.get("note") or "").strip())
+        if keep_id:
+            r.id = keep_id
+        return r
+
+    def _commit(self, rows: list[Row], text: str, line: str):
+        check_overlaps(rows)                               # raises before anything changes
+        with self.lock:
+            self.schedule = sorted(rows, key=lambda r: (r.line.lower(), r.start))
+            self.schedule_updated = datetime.now().strftime("%b %d %I:%M %p") + ", " + text[0].lower() + text[1:]
+            self.note("schedule", line, text)
+            self.save()
+        self.version(text)
+
+    def replace_line(self, line: str, rows: list[Row]):
+        """Save one line exactly as edited in the app. Other lines are untouched."""
+        for r in rows:
+            r.line = line
+            if r.end <= r.start:
+                r.end += timedelta(days=1)
+            if r.end - r.start > timedelta(hours=48):
+                raise ScheduleError(f"WO {r.wo} runs longer than 48 hours. Check its start and end.")
+        keep = [x for x in self.schedule if norm(x.line) != norm(line)]
+        self._commit(keep + rows, f"Saved {line} with {len(rows)} work order{'s' if len(rows) != 1 else ''}", line)
+
+    def add_row(self, d: dict) -> Row:
+        r = self._row_from(d)
+        self._commit(list(self.schedule) + [r], f"Added WO {r.wo} on {r.line}, {r.start:%b %d %I:%M %p} to {r.end:%I:%M %p}", r.line)
+        return r
+
+    def update_row(self, rid: str, d: dict) -> Row:
+        old = next((x for x in self.schedule if x.id == rid), None)
+        if not old:
+            raise ScheduleError("that work order is no longer in the schedule")
+        r = self._row_from({**old.to_json(), **d}, keep_id=rid)
+        rows = [r if x.id == rid else x for x in self.schedule]
+        self._commit(rows, f"Changed {old.line} WO {old.wo} to WO {r.wo} on {r.line}, {r.start:%b %d %I:%M %p} to {r.end:%I:%M %p}", r.line)
+        return r
+
+    def delete_row(self, rid: str):
+        old = next((x for x in self.schedule if x.id == rid), None)
+        if not old:
+            raise ScheduleError("that work order is no longer in the schedule")
+        self._commit([x for x in self.schedule if x.id != rid], f"Removed WO {old.wo} from {old.line} ({old.start:%b %d %I:%M %p})", old.line)
+
+    def move_row(self, rid: str, direction: int):
+        """Swap a WO with the one before or after it on the same line. The time slots stay, the work orders trade places."""
+        row = next((x for x in self.schedule if x.id == rid), None)
+        if not row:
+            raise ScheduleError("that work order is no longer in the schedule")
+        same = sorted([x for x in self.schedule if norm(x.line) == norm(row.line)], key=lambda x: x.start)
+        i = same.index(row)
+        j = i + (1 if direction > 0 else -1)
+        if j < 0 or j >= len(same):
+            raise ScheduleError("nothing to swap with in that direction")
+        a, b = same[i], same[j]
+        for k in ("wo", "codes", "note"):
+            va, vb = getattr(a, k), getattr(b, k)
+            setattr(a, k, vb)
+            setattr(b, k, va)
+        self._commit(list(self.schedule), f"Swapped WO {b.wo} and WO {a.wo} on {row.line}", row.line)
+
+    def restore(self, vid: int):
+        rows = self.store.version_rows(vid)
+        if rows is None:
+            raise ScheduleError("that saved version was not found")
+        self._commit([Row.from_json(r) for r in rows], f"Restored the schedule saved as version {vid}", "Schedule")
 
     def note(self, kind: str, line: str, text: str):
         self.activity.insert(0, {"time": datetime.now().strftime("%b %d %H:%M:%S"), "kind": kind,
@@ -417,6 +519,7 @@ class Engine:
                 "live_wo": ln.get("live_wo"), "mode": ln.get("mode"), "hold": ln.get("hold", False),
                 "override": ln.get("override"), "error": ln.get("error", ""),
                 "now": cur.to_json() if cur else None, "next": nxt.to_json() if nxt else None,
+                "next_codes": (self.checks.get(self.resolve(nxt.wo), self.checks.get(nxt.wo, {})) or {}).get("codes", []) if nxt else [],
                 "rows": [r.to_json() for r in rows],
             })
         unmatched = sorted({r.line for r in self.schedule if not self.group_for(r.line)})
@@ -429,7 +532,12 @@ class Engine:
                 "upcoming": len(today), "activity": self.activity[:120],
                 "problems": self.problems(), "checked": sum(1 for w in now_wos if w in self.checks),
                 "ok_count": sum(1 for w in now_wos if self.checks.get(w, {}).get("status") == "ok"),
-                "wo_total": len(now_wos), "wo_map": self.wo_map,
+                "wo_total": len(now_wos), "wo_map": self.wo_map, "wo_source": self.tcp.wo_source,
+                "storage": self.store.status(), "schedule_updated": self.schedule_updated,
+                "wo_steps": {w: [c.get("fullName") or c.get("description") or c.get("id") for c in (self.checks.get(w) or {}).get("codes", [])]
+                             for w in now_wos},
+                "plan": [{"time": r.start.isoformat(), "line": r.line, "wo": r.wo, "end": r.end.isoformat(), "note": r.note}
+                         for r in sorted(self.schedule, key=lambda x: x.start) if r.start > now][:40],
                 "line_map": {next((r.line for r in self.schedule if norm(r.line) == k), k): self.groups.get(v, {}).get("description", v)
                              for k, v in self.line_map.items()},
                 "group_names": [{"id": gid, "name": g["description"]} for gid, g in sorted(self.groups.items(), key=lambda kv: kv[1]["description"].lower())]}

@@ -3,3 +3,4 @@ uvicorn
 requests
 openpyxl
 python-multipart
+psycopg[binary]==3.2.3

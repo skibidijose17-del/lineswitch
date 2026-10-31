@@ -84,8 +84,10 @@ async def upload(file: UploadFile = File(...)):
         keep = [r for r in engine.schedule if r.line.lower().replace(" ", "") not in lines]
         engine.schedule = sorted(keep + rows, key=lambda r: (r.line.lower(), r.start))
         engine.schedule_file = file.filename
+        engine.schedule_updated = datetime.now().strftime("%b %d %H:%M") + f" uploaded {file.filename}"
         engine.note("schedule", "Schedule", f"{file.filename}: {len(rows)} work orders on {len(lines)} lines loaded")
         engine.save()
+    engine.version(f"Uploaded {file.filename}")
     probs = engine.validate() if tcp.configured else []
     engine.tick()
     v = engine.view()
@@ -97,6 +99,64 @@ async def upload(file: UploadFile = File(...)):
     elif tcp.configured:
         msg += " Every work order and line was found in TCP."
     return {"ok": True, "message": msg, "state": v}
+
+
+@app.get("/api/schedule")
+def get_schedule():
+    """The whole schedule, every row, for the schedule editor."""
+    return {"file": engine.schedule_file, "updated": engine.schedule_updated,
+            "rows": [r.to_json() for r in sorted(engine.schedule, key=lambda x: (x.line.lower(), x.start))]}
+
+
+@app.put("/api/schedule/line")
+async def put_line(request: Request):
+    """Replace all rows of one line with what was edited in the UI.
+    Body: {line, rows: [{wo, start, end, note, codes}]}, times as 'YYYY-MM-DDTHH:MM' in plant time."""
+    b = await request.json()
+    line = str(b.get("line", "")).strip()
+    if not line:
+        return JSONResponse({"ok": False, "message": "Missing line"}, 400)
+    try:
+        rows = []
+        for i, r in enumerate(b.get("rows") or [], start=1):
+            wo = str(r.get("wo", "")).strip()
+            if not wo:
+                raise ScheduleError(f"row {i} has no work order")
+            try:
+                start, end = datetime.fromisoformat(str(r["start"])), datetime.fromisoformat(str(r["end"]))
+            except Exception:  # noqa
+                raise ScheduleError(f"row {i} (WO {wo}) has a start or end time that can't be read")
+            codes = r.get("codes") or []
+            if isinstance(codes, str):
+                codes = [c.strip() for c in codes.replace(";", ",").split(",") if c.strip()]
+            rows.append(Row(line, wo, start.replace(second=0, microsecond=0), end.replace(second=0, microsecond=0),
+                            codes, str(r.get("note") or "").strip()))
+        engine.replace_line(line, rows)
+    except ScheduleError as e:
+        return JSONResponse({"ok": False, "message": str(e)}, 400)
+    probs = engine.validate() if tcp.configured else []
+    engine.tick()
+    bad = [p for p in probs if p["type"] == "wo" and any(p["key"] == r.wo for r in rows)]
+    msg = f"{line} saved with {len(rows)} work orders." + (f" {len(bad)} of them aren't in TCP yet, see Issues." if bad else "")
+    return {"ok": True, "message": msg, "state": engine.view(), "schedule": get_schedule()}
+
+
+@app.get("/api/schedule/versions")
+def schedule_versions():
+    """Every saved copy of the schedule (kept in Neon), newest first."""
+    return {"storage": engine.store.status(), "versions": engine.store.versions()}
+
+
+@app.post("/api/schedule/versions/{vid}/restore")
+def restore_version(vid: int):
+    try:
+        engine.restore(vid)
+    except ScheduleError as e:
+        return JSONResponse({"ok": False, "message": str(e)}, 400)
+    if tcp.configured:
+        engine.validate()
+    engine.tick()
+    return {"ok": True, "message": f"Schedule restored to version {vid}", "state": engine.view(), "schedule": get_schedule()}
 
 
 @app.post("/api/validate")
@@ -147,6 +207,7 @@ def clear_schedule():
         engine.schedule = []
         engine.note("schedule", "Schedule", "Schedule cleared")
         engine.save()
+    engine.version("Cleared the schedule")
     return engine.view()
 
 
@@ -230,6 +291,17 @@ def apilog(errors: int = 0):
 def apilog_clear():
     API_LOG.clear()
     return []
+
+
+@app.get("/api/schedule.csv")
+def schedule_csv():
+    """The schedule LineSwitch is following right now, as a CSV the client can open in Excel."""
+    out = ["Line,Work Order,Start,End,Cost Codes,Note"]
+    for r in sorted(engine.schedule, key=lambda x: (x.line.lower(), x.start)):
+        note = (r.note or "").replace('"', "'")
+        out.append(f'{r.line},{r.wo},{r.start:%Y-%m-%d %H:%M},{r.end:%Y-%m-%d %H:%M},"{";".join(r.codes)}","{note}"')
+    return Response("\n".join(out) + "\n", media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=lineswitch_current_schedule.csv"})
 
 
 @app.get("/api/sample")
