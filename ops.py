@@ -46,6 +46,7 @@ def _dt(s):
 class Ops:
     def __init__(self, engine):
         self.e = engine
+        self.last_failed: list[str] = []
         self.settings = dict(DEFAULTS)
         self.runs: list[dict] = []       # one per WO run on a line: start, end, who, units
         self.downtime: list[dict] = []   # line stops with reason codes
@@ -114,6 +115,8 @@ class Ops:
     def on_switch(self, gid: str, old_wo: str | None, new_wo: str, reason: str):
         g = self.e.groups.get(gid) or {}
         name = g.get("description", gid)
+        if reason == "tidy":
+            return self._stuck(gid, new_wo)
         how = "by hand" if "hand" in reason else ("setup" if "setup" in reason else "schedule")
         by = (self.e.lines.get(gid) or {}).get("started_by", "") if how == "setup" else ""
         at = None
@@ -129,6 +132,15 @@ class Ops:
                     self.e.note("switch", name, f"Moved {len(moved)} people from WO {old_wo} to WO {new_wo}: " + ", ".join(moved))
             except Exception as ex:  # noqa
                 self.e.note("error", name, f"Could not move people to WO {new_wo}: {ex}")
+        return self._stuck(gid, new_wo)
+
+    def _stuck(self, gid: str, new_wo: str) -> list[dict]:
+        """Who is still punched in on another WO's code (the engine keeps those codes on the line so they can punch out)."""
+        try:
+            pre = str(new_wo).upper() + "\\"
+            return [p for p in self.people(gid) if p["costCode"] and not p["costCode"].upper().startswith(pre)]
+        except Exception:  # noqa
+            return []
 
     # ------------------------------------------------------------ people
     def people(self, gid: str) -> list[dict]:
@@ -149,8 +161,20 @@ class Ops:
         new_codes = [c["fullName"] for c in self.e.tcp.wo_cost_codes(new_wo)[0]]
         if not new_codes:
             return []
-        moved, rows = [], []
-        for p in self.people(gid):
+        g = self._group(gid)
+        jc = self.e.tcp.line_job_code(g["description"])
+        people = self.people(gid)
+        # TCP refuses to close a segment whose cost code is no longer on the line, so put such codes back for the move
+        on_line = {c.get("fullName", "").upper() for c in self.e.tcp.group_codes(g["description"])}
+        need = {p["costCode"].upper() for p in people
+                if p["costCode"] and p["costCode"].upper().startswith(str(old_wo).upper() + "\\") and p["costCode"].upper() not in on_line}
+        if need:
+            back = [c for c in self.e.tcp.wo_cost_codes(old_wo)[0] if c.get("fullName", "").upper() in need]
+            if back:
+                self.e.tcp.swap_group(g, [], back)
+        moved, failed = [], []
+        self.last_failed = []
+        for p in people:
             code = p["costCode"]
             if not code or not code.upper().startswith(str(old_wo).upper() + "\\"):
                 continue
@@ -158,20 +182,48 @@ class Ops:
             target = next((c for c in new_codes if c.split("\\", 1)[1].upper() == rest), None) \
                 or next((c for c in new_codes if c.split("\\", 1)[1].split("\\")[0].upper() == rest.split("\\")[0]), None) \
                 or new_codes[0]
-            rows.append({"operationType": "changeCostCode", "employeeId": int(p["employeeId"]), "costCodeName": target,
-                         "timeOut": self.e.tcp.stamp()})
-            moved.append(f"{p['name']} to {target}")
-        if rows:
-            self.e.tcp.punch(rows)
+            try:
+                self.change_code(p["employeeId"], jc, target)
+                moved.append(f"{p['name']} to {target}")
+            except TcpError as ex:
+                failed.append(f"{p['name']} ({ex})")
+        self.last_failed = failed
+        if failed:
+            self.e.note("error", g["description"], "Could not move: " + "; ".join(failed))
         return moved
 
+    def change_code(self, eid, job_code, cost_code: str):
+        """Move one clocked in person to another cost code on the same job code.
+        TCP checks the cost code against the job code, so the line's job code goes with it.
+        If changeCostCode is refused, changeJobCode to the same job code with the new cost code does the same thing."""
+        base = {"employeeId": int(eid), "costCodeName": cost_code, "timeOut": self.e.tcp.stamp()}
+        if job_code:
+            base["jobCodeId"] = int(job_code)
+        try:
+            return self.e.tcp.punch([{"operationType": "changeCostCode", **base}])
+        except TcpError as first:
+            if not job_code:
+                raise
+            try:
+                return self.e.tcp.punch([{"operationType": "changeJobCode", **base}])
+            except TcpError:
+                raise first
+
     def clock_off(self, gid: str, why: str) -> list[str]:
-        rows, names = [], []
+        """Clock everyone on the line off, one at a time so one refusal doesn't stop the rest."""
+        names, failed = [], []
         for p in self.people(gid):
-            rows.append({"operationType": "clockOut", "employeeId": int(p["employeeId"]), "timeOut": self.e.tcp.stamp()})
+            if not self.e.preview:
+                try:
+                    self.e.tcp.punch([{"operationType": "clockOut", "employeeId": int(p["employeeId"]), "timeOut": self.e.tcp.stamp()}])
+                except TcpError as ex:
+                    failed.append(f"{p['name']} on {p['costCode'] or 'no cost code'} ({ex})")
+                    continue
             names.append(p["name"])
-        if rows and not self.e.preview:
-            self.e.tcp.punch(rows)
+        if failed:
+            raise ValueError(("Clocked off " + ", ".join(names) + ". " if names else "") +
+                             "TCP would not clock off " + "; ".join(failed) +
+                             ". Their cost code is no longer on this line, so fix their punch in TCP and try again.")
         return names
 
     # ------------------------------------------------------------ setup person and line actions
@@ -214,11 +266,13 @@ class Ops:
         try:
             off = self.clock_off(gid, kind)
         except Exception as ex:  # noqa
-            off = []
-            self.e.note("error", name, f"Could not clock people off the line: {ex}")
+            self.e.note("error", name, f"Could not clock everyone off the line: {ex}")
+            self.e.save()
+            raise ValueError(str(ex))   # the run stays open so the setup person can fix it and press End again
         run = self.open_run(name)
         if run and not self.e.preview:
             run["end"], run["end_reason"] = _iso(_now()), ("WO end" if kind == "wo" else "shift end") + (f" ({by})" if by else "")
+        self.e.tidy(gid)                                  # nobody is on the line now, so leftover codes can go
         ln = self.e.lines[gid]
         ln["hold"], ln["override"] = True, None          # the line waits for the next setup or resume
         label = "WO end" if kind == "wo" else "Shift end"
