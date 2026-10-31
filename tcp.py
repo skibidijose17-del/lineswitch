@@ -127,13 +127,16 @@ class Tcp:
     def group_codes(self, description: str) -> list[dict]:
         """Cost codes currently in one group: [{'id','fullName','description'}]."""
         rows = self.get_all("/costcodegroupmembers", {"costCodeGroupDescriptions": description})
+        act = {str(c.get("fullName", "")).lower(): c.get("isActive", True) is not False for c in self._all_codes()}
         out = []
         for r in rows:
             if r.get("groupDescription") not in (None, description):
                 continue
             for c in r.get("costCodes") or []:
-                out.append({"id": str(c.get("id", "")), "fullName": c.get("fullName") or "",
-                            "description": c.get("description") or ""})
+                full = c.get("fullName") or ""
+                on = c.get("isActive") if "isActive" in c else act.get(full.lower(), True)
+                out.append({"id": str(c.get("id", "")), "fullName": full,
+                            "description": c.get("description") or "", "isActive": on is not False})
         return out
 
     def job_code(self, wo: str) -> dict | None:
@@ -152,7 +155,7 @@ class Tcp:
         now = time.time()
         if getattr(self, "_codes_cache", None) and now - self._codes_at < 60:
             return self._codes_cache
-        rows = self.get_all("/costcodes", {"isActive": "true"})
+        rows = self.get_all("/costcodes")            # active and inactive: finished WOs are turned off, not deleted
         self._codes_cache, self._codes_at = rows, now
         return rows
 
@@ -163,14 +166,55 @@ class Tcp:
             [str(c.get(f"level{i}") or "") for i in range(1, 6) if c.get(f"level{i}")]
 
     def level1_codes(self, wo: str) -> list[dict]:
-        """Active cost codes whose Level 1 is the WO and that have a Level 2 (112\\SETUP, not the bare 112 node)."""
+        """Cost codes whose Level 1 is the WO and that have a Level 2 (112\\SETUP, not the bare 112 node).
+        Inactive ones are included (with isActive False): LineSwitch turns them back on when the WO runs again."""
         out = []
         for c in self._all_codes():
             p = self._parts(c)
             if len(p) >= 2 and p[0].strip().lower() == str(wo).strip().lower():
                 out.append({"id": str(c.get("id", "")), "fullName": c.get("fullName") or "\\".join(p),
-                            "description": c.get("description") or ""})
+                            "description": c.get("description") or "", "isActive": c.get("isActive", True) is not False})
         return out
+
+    def is_active(self, full_name: str) -> bool:
+        k = str(full_name).lower()
+        for c in self._all_codes():
+            if str(c.get("fullName", "")).lower() == k:
+                return c.get("isActive", True) is not False
+        return True
+
+    def set_active(self, codes: list[dict], active: bool) -> list[str]:
+        """Turn cost codes on or off. PUT /costcodes/{id} takes the whole record, so read it and send it back
+        with only isActive changed (groups, schedule org and the rest stay as they are)."""
+        done = []
+        for c in codes:
+            cur = (self.req("GET", f"/costcodes/{c['id']}") or {}).get("data")
+            if isinstance(cur, list):
+                cur = cur[0] if cur else None
+            if not cur or (cur.get("isActive", True) is not False) == active:
+                continue
+            parts = self._parts(cur)
+            body = {f"level{i + 1}": v for i, v in enumerate(parts[:5])}
+            body.update({
+                "description": cur.get("description") or "",
+                "isActive": active,
+                "notes": cur.get("notes") or None,
+                "numericAlias": cur.get("alias"),
+                "expirationDate": cur.get("expirationDate"),
+                "geoFenceGroup": cur.get("geoFenceGroup"),
+                "costCodeGroups": [g.get("description") if isinstance(g, dict) else str(g) for g in (cur.get("costCodeGroups") or [])],
+                "scheduleOrg": [o.get("name") if isinstance(o, dict) else str(o) for o in (cur.get("scheduleOrg") or [])] or ["default"],
+            })
+            for k in ("budgetHours", "budgetDollars", "stage", "billable", "udf1", "udf2", "udf3", "udf4"):
+                v = (cur.get("settings") or {}).get(k, cur.get(k))
+                if v is not None:
+                    body[k] = v
+            body = {k: v for k, v in body.items() if v is not None}
+            self.req("PUT", f"/costcodes/{c['id']}", body=body)
+            done.append(cur.get("fullName") or "\\".join(parts))
+        if done:
+            self._codes_cache = None
+        return done
 
     def level1_values(self) -> list[str]:
         return sorted({self._parts(c)[0] for c in self._all_codes() if len(self._parts(c)) >= 2})
