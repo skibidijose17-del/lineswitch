@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -55,6 +56,7 @@ class Row:
     units: float | None = None      # production units planned (budget units)
     workers: float | None = None    # workers planned (budget workers)
     so_sku: str = ""                # Sales Order + SKU, links WOs together (387-100312)
+    steps: list[str] = field(default_factory=list)   # optional: this WO's steps, SETUP, FILLING\CAPPER, QC
 
     def covers(self, t: datetime) -> bool:
         return self.start <= t < self.end
@@ -68,7 +70,8 @@ class Row:
     def from_json(d):
         return Row(d["line"], d["wo"], datetime.fromisoformat(d["start"]), datetime.fromisoformat(d["end"]),
                    d.get("codes") or [], d.get("note", ""), d.get("id") or uuid.uuid4().hex[:10],
-                   d.get("sku", "") or "", d.get("sku_desc", "") or "", _num(d.get("units")), _num(d.get("workers")), d.get("so_sku", "") or "")
+                   d.get("sku", "") or "", d.get("sku_desc", "") or "", _num(d.get("units")), _num(d.get("workers")), d.get("so_sku", "") or "",
+                   _steps(d.get("steps")))
 
 
 HEAD = {
@@ -79,10 +82,24 @@ HEAD = {
     "sku": "sku", "item": "sku", "skudescription": "sku_desc", "description": "sku_desc", "product": "sku_desc", "productdescription": "sku_desc",
     "units": "units", "productionunits": "units", "plannedunits": "units", "budgetunits": "units", "qty": "units", "quantity": "units",
     "workers": "workers", "workersassigned": "workers", "numberofworkers": "workers", "budgetworkers": "workers", "crew": "workers", "headcount": "workers",
+    "steps": "steps", "tasks": "steps", "activities": "steps", "wosteps": "steps",
     "sosku": "so_sku", "salesordersku": "so_sku", "salesorder": "so_sku", "so": "so_sku",
 }
 FORMATS = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y %I:%M %p",
            "%m/%d/%y %H:%M", "%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d %I:%M %p"]
+
+
+def _steps(v) -> list[str]:
+    """'Setup, Filling\\Capper; QC' -> ['SETUP', 'FILLING\\CAPPER', 'QC']. Also takes 'Filling/Capper' or 'Filling > Capper'."""
+    if not v:
+        return []
+    items = v if isinstance(v, list) else str(v).replace(";", ",").replace("\n", ",").split(",")
+    out = []
+    for x in items:
+        x = re.sub(r"\s*(\\\\|/|>)\s*", "\\\\", str(x).strip()).upper()
+        if x and x not in out:
+            out.append(x)
+    return out
 
 
 class ScheduleError(ValueError):
@@ -143,7 +160,7 @@ def parse_schedule(name: str, data: bytes) -> list[Row]:
             so = so[:-2]
         rows.append(Row(str(r["line"]).strip(), wo, start, end, codes, str(r.get("note") or "").strip(),
                         sku=str(r.get("sku") or "").strip().removesuffix(".0"), sku_desc=str(r.get("sku_desc") or "").strip(),
-                        units=_num(r.get("units")), workers=_num(r.get("workers")), so_sku=so))
+                        units=_num(r.get("units")), workers=_num(r.get("workers")), so_sku=so, steps=_steps(r.get("steps"))))
     check_overlaps(rows)
     return rows
 
@@ -229,7 +246,8 @@ class Engine:
             codes = [c.strip() for c in codes.replace(";", ",").split(",") if c.strip()]
         r = Row(line, wo, start.replace(second=0, microsecond=0), end.replace(second=0, microsecond=0), codes, str(d.get("note") or "").strip(),
                 sku=str(d.get("sku") or "").strip(), sku_desc=str(d.get("sku_desc") or "").strip(),
-                units=_num(d.get("units")), workers=_num(d.get("workers")), so_sku=str(d.get("so_sku") or "").strip())
+                units=_num(d.get("units")), workers=_num(d.get("workers")), so_sku=str(d.get("so_sku") or "").strip(),
+                steps=_steps(d.get("steps")))
         if keep_id:
             r.id = keep_id
         return r
@@ -368,7 +386,17 @@ class Engine:
             try:
                 if self.tcp.wo_source == "level1":
                     codes, groups = self.tcp.wo_cost_codes(tcp_id)
-                    if not codes and self.ops.settings.get("auto_create"):
+                    steps, desc = self.steps_for(wo)
+                    if steps:
+                        # the scheduler listed this WO's steps: create the ones TCP doesn't have yet
+                        have = {norm(c["fullName"]) for c in codes}
+                        if any(norm(f"{tcp_id}\\{st}") not in have for st in steps):
+                            try:
+                                self.ops.create_codes(tcp_id, steps, desc)
+                                codes, groups = self.tcp.wo_cost_codes(tcp_id)
+                            except Exception as ex:  # noqa
+                                chk["message"] = f"could not create its cost codes in TCP: {ex}"
+                    elif not codes and self.ops.settings.get("auto_create"):
                         try:
                             self.ops.create_codes(tcp_id)
                             codes, groups = self.tcp.wo_cost_codes(tcp_id)
@@ -442,17 +470,35 @@ class Engine:
         return next((r for r in self.rows_for(gid) if r.start > t), None)
 
     # ---------------- switching
+    def steps_for(self, wo: str) -> tuple[list[str], str]:
+        """The steps the schedule lists for a WO (first row that has them), and its SKU description."""
+        for r in sorted(self.schedule, key=lambda x: x.start):
+            if norm(r.wo) == norm(wo) and r.steps:
+                return r.steps, r.sku_desc
+        return [], ""
+
     def desired_codes(self, wo: str, row: Row | None) -> tuple[list[dict], str]:
+        steps = (row.steps if row and row.steps else self.steps_for(wo)[0])
+        if steps and not (row and row.codes):
+            tcp_id = self.resolve(wo)
+            codes = self.tcp.wo_cost_codes(tcp_id)[0]
+            names = {norm(f"{tcp_id}\\{st}") for st in steps}
+            pick = [c for c in codes if norm(c["fullName"]) in names]
+            if pick:
+                order = [norm(f"{tcp_id}\\{st}") for st in steps]
+                pick.sort(key=lambda c: order.index(norm(c["fullName"])))
+                missing = [st for st in steps if norm(f"{tcp_id}\\{st}") not in {norm(c["fullName"]) for c in pick}]
+                return pick, "steps from the schedule" + (f" (not in TCP yet: {', '.join(missing)})" if missing else "")
         if row and row.codes:
-            all_codes = self.tcp.get_all("/costcodes", {"isActive": "true"})
+            all_codes = self.tcp._all_codes()
             found, missing = [], []
             for want in row.codes:
                 hit = next((c for c in all_codes if norm(c.get("fullName")) == norm(want) or norm(c.get("description")) == norm(want)), None)
                 (found if hit else missing).append(hit or want)
             if missing:
                 raise TcpError(404, "cost codes not found in TCP: " + ", ".join(missing))
-            return [{"id": str(c.get("id")), "fullName": c.get("fullName") or "", "description": c.get("description") or ""}
-                    for c in found], "listed in the schedule"
+            return [{"id": str(c.get("id")), "fullName": c.get("fullName") or "", "description": c.get("description") or "",
+                     "isActive": c.get("isActive", True) is not False} for c in found], "listed in the schedule"
         tcp_id = self.resolve(wo)
         codes, groups = self.tcp.wo_cost_codes(tcp_id)
         if not codes:
