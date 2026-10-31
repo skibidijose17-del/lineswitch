@@ -93,7 +93,7 @@ class Tcp:
             if r.status_code == 401 and attempt == 1:
                 self._token = None
                 continue
-            if r.status_code in (429, 500, 502, 503, 504):
+            if r.status_code in (429, 502, 503, 504) or (r.status_code == 500 and method != "POST"):   # a POST is not retried on 500: it may have half landed
                 time.sleep(min(2 ** attempt, 20))
                 continue
             if r.status_code >= 400:
