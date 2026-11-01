@@ -252,8 +252,22 @@ class Engine:
             r.id = keep_id
         return r
 
+    def check_codes(self, rows: list[Row]):
+        """A cost code listed on a row has to belong to that row's WO, or its hours land on the other WO in TCP."""
+        bad = []
+        for r in rows:
+            ok = {norm(r.wo), norm(self.resolve(r.wo))}
+            for c in r.codes:
+                if "\\" in c and norm(c.split("\\")[0]) not in ok:
+                    bad.append(f"{r.line} WO {r.wo} lists {c}")
+        if bad:
+            raise ScheduleError("these cost codes belong to a different work order: " + "; ".join(bad[:5])
+                                + (f" and {len(bad) - 5} more" if len(bad) > 5 else "")
+                                + ". Use that row's own WO codes, or list the steps in the Steps column instead.")
+
     def _commit(self, rows: list[Row], text: str, line: str):
         check_overlaps(rows)                               # raises before anything changes
+        self.check_codes(rows)
         with self.lock:
             self.schedule = sorted(rows, key=lambda r: (r.line.lower(), r.start))
             self.schedule_updated = datetime.now().strftime("%b %d %I:%M %p") + ", " + text[0].lower() + text[1:]
@@ -513,6 +527,12 @@ class Engine:
                 (found if hit else missing).append(hit or want)
             if missing:
                 raise TcpError(404, "cost codes not found in TCP: " + ", ".join(missing))
+            tcp_id = self.resolve(wo)
+            other = [c.get("fullName", "") for c in found
+                     if norm(str(c.get("fullName", "")).split("\\")[0]) not in {norm(wo), norm(tcp_id)}]
+            if other:
+                raise TcpError(409, f"WO {wo} lists cost codes of another work order: {', '.join(other)}. "
+                                    "Hours on them would count toward that WO, so the line was not switched.")
             return [{"id": str(c.get("id")), "fullName": c.get("fullName") or "", "description": c.get("description") or "",
                      "isActive": c.get("isActive", True) is not False} for c in found], "listed in the schedule"
         tcp_id = self.resolve(wo)
