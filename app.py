@@ -73,6 +73,7 @@ async def upload(file: UploadFile = File(...)):
     data = await file.read()
     try:
         rows = parse_schedule(file.filename, data)
+        engine.check_codes(rows)
     except ScheduleError as e:
         engine.note("error", "Schedule", f"{file.filename} was not loaded: {e}")
         return JSONResponse({"ok": False, "message": f"{file.filename} was not loaded: {e}"}, 400)
