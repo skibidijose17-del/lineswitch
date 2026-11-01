@@ -575,8 +575,8 @@ class Engine:
         self.save()
 
     def retire(self, gid: str, old: list[dict], stuck: list[dict]):
-        """Turn off old WO codes on a line, except ones someone is still punched in on
-        and ones whose WO is running on another line right now. Returns (turned off, note)."""
+        """Turn off old WO codes on a line, except ones someone is still punched in on.
+        Codes whose WO is running on another line are taken off this group instead. Returns (turned off, note)."""
         if not old:
             return [], ""
         on_them = {norm(p["costCode"]) for p in stuck}
@@ -609,12 +609,15 @@ class Engine:
         off = [c for c in old if c not in held and c not in shared]
         if off:
             self.tcp.set_active(off, False)
+        if shared:
+            # the same codes are live on another line, so they stay on there, but this kiosk should not offer them
+            self.tcp.swap_group(self.groups[gid], shared, [])
         lab = lambda cs: ", ".join(c.get("fullName", "") for c in cs)
         note = ""
         if held:
             note += f" Left {lab(held)} on so {', '.join(p['name'] for p in stuck)} can punch out; it turns off once they move or clock off."
         if shared:
-            note += f" Left {lab(shared)} on because that WO is running on another line; it turns off when that WO ends."
+            note += f" Took {lab(shared)} off this kiosk; they stay on for the other line running that WO."
         if stray:
             note += f" Took {len(stray)} codes that belong to other areas off this kiosk: " + ", ".join(c.get("fullName", "") for c in stray) + "."
         return off, note
