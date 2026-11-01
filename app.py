@@ -142,6 +142,9 @@ async def put_line(request: Request):
     engine.tick()
     bad = [p for p in probs if p["type"] == "wo" and any(p["key"] == r.wo for r in rows)]
     msg = f"{line} saved with {len(rows)} work orders." + (f" {len(bad)} of them aren't in TCP yet, see Issues." if bad else "")
+    held = next((l for gid, l in engine.lines.items() if engine.groups.get(gid, {}).get("description") == line and l.get("hold") and l.get("hold_kind") != "end"), None)
+    if held:
+        msg += f" {line} is paused, so it won't switch until you press Resume schedule on the Board."
     return {"ok": True, "message": msg, "state": engine.view(), "schedule": get_schedule()}
 
 
@@ -236,7 +239,7 @@ async def switch(gid: str, request: Request):
 @app.post("/api/lines/{gid}/hold")
 def hold(gid: str):
     ln = _line(gid)
-    ln["hold"] = True
+    ln["hold"], ln["hold_kind"] = True, "pause"
     engine.note("hold", engine.groups.get(gid, {}).get("description", gid), "Automatic switching paused")
     engine.save()
     return engine.view()
@@ -246,6 +249,7 @@ def hold(gid: str):
 def resume(gid: str):
     ln = _line(gid)
     ln["hold"], ln["override"], ln["retry_at"], ln["error"], ln["started_by"] = False, None, 0, "", ""
+    ln["hold_kind"] = None
     engine.note("resume", engine.groups.get(gid, {}).get("description", gid), "Following the schedule again")
     engine.save()
     engine.tick()
