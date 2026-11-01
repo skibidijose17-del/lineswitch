@@ -633,6 +633,16 @@ class Engine:
         with self.lock:
             for gid, ln in list(self.lines.items()):
                 g = self.groups.get(gid)
+                if ln.get("hold") and ln.get("hold_kind") == "end" and self.ops.settings.get("start_mode") != "setup":
+                    # after End work order or End shift, the next WO in the schedule starts the line again
+                    nxt = self.now_row(gid, now)
+                    try:
+                        held = datetime.fromisoformat(ln.get("held_at") or "")
+                    except ValueError:
+                        held = now
+                    if nxt and nxt.start > held:
+                        ln["hold"], ln["hold_kind"] = False, None
+                        self.note("resume", (g or {}).get("description", gid), f"Following the schedule again: WO {nxt.wo} starts at {nxt.start:%H:%M}")
                 if not g or not ln.get("is_line") or ln.get("hold"):
                     continue
                 if ln.get("override"):
