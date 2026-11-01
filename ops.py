@@ -286,7 +286,8 @@ class Ops:
             run["end"], run["end_reason"] = _iso(_now()), ("WO end" if kind == "wo" else "shift end") + (f" ({by})" if by else "")
         self.e.tidy(gid)                                  # nobody is on the line now, so leftover codes can go
         ln = self.e.lines[gid]
-        ln["hold"], ln["override"] = True, None          # the line waits for the next setup or resume
+        ln["hold"], ln["override"] = True, None          # the line waits for the next setup, a resume,
+        ln["hold_kind"], ln["held_at"] = "end", _iso(_now())   # or the next WO in the schedule
         label = "WO end" if kind == "wo" else "Shift end"
         who = f" Clocked off: {', '.join(off)}." if off else " Nobody was clocked in."
         self.e.note("preview" if self.e.preview else "switch", name,
