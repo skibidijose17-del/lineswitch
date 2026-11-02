@@ -22,16 +22,30 @@ DEFAULTS = {
     "labor_rate": 25.0,
     # steps (level 2) every WO gets, and the line positions (level 3) under FILLING
     "roles": ["SETUP", "VERIFY", "FILLING", "QC", "LINE REPAIR", "CHANGE OVER"],
-    "functions": [],
+    # Product Society's line positions under FILLING (their functional requirements, Diagram 1)
+    "functions": ["FILLING", "CAPPING", "LABELING", "BAGGING", "CRIMPING", "INSERTING", "INNER PACKING", "OUTER PACKING", "ASSEMBLING", "CLEANING"],
     # steps that are not counted in unit filling cost
     "exclude_from_cost": ["LINE REPAIR"],
     # create the cost codes in TCP for a WO in the schedule that doesn't have them yet
-    "auto_create": False,
+    "auto_create": True,
+    # a scheduled switch waits while anyone on the line is still punched in on the old WO (an order that runs long
+    # keeps the line until the line lead ends it or everyone clocks out in TCP)
+    "wait_for_clear": True,
+    # phase 1 can run the board as a schedule upload only: hide the line tablet
+    "show_tablet": True,
     # line down is recorded in TCP: every WO gets this step (101\\LINE DOWN) and Line down moves everyone on the
     # line to it; Line back up puts each person back on their own step. Empty = record line down in LineSwitch only.
     "line_down_step": "LINE DOWN",
+    # Line Repair is clocked at the kiosk with its reason as level 3 (WO\LINE REPAIR\MACHINE JAM), so downtime and
+    # its reason live in TCP. Empty = a plain WO\LINE REPAIR code.
+    "repair_reasons": ["MACHINE JAM", "LABELER", "MATERIAL SHORT", "CHANGEOVER", "QUALITY HOLD", "MAINTENANCE", "OTHER"],
     "downtime_reasons": ["Machine jam", "Labeler issue", "Material shortage", "Changeover", "Quality hold", "Waiting on maintenance", "Other"],
 }
+
+
+def wol(w) -> str:
+    w = str(w if w is not None else "")
+    return f"WO {w}" if w[:1].isdigit() else w
 
 
 def _now():
@@ -70,13 +84,13 @@ class Ops:
                 continue
             if k == "labor_rate":
                 v = max(0.0, float(v))
-            elif k in ("move_on_switch", "auto_create"):
+            elif k in ("move_on_switch", "auto_create", "wait_for_clear", "show_tablet"):
                 v = bool(v)
             elif k == "line_down_step":
                 v = str(v or "").strip().upper()
             elif k == "start_mode":
                 v = "setup" if v == "setup" else "schedule"
-            elif k in ("roles", "functions", "exclude_from_cost", "downtime_reasons"):
+            elif k in ("roles", "functions", "exclude_from_cost", "downtime_reasons", "repair_reasons"):
                 v = [str(x).strip() for x in (v or []) if str(x).strip()]
                 if k != "downtime_reasons":
                     v = [x.upper() for x in v]
@@ -101,7 +115,9 @@ class Ops:
         if not rows:
             return {}
         r = min(rows, key=lambda x: abs((x.start - at).total_seconds()))
-        return {k: getattr(r, k, "") for k in ("sku", "sku_desc", "units", "workers", "so_sku")}
+        out = {k: getattr(r, k, "") for k in ("sku", "sku_desc", "units", "workers", "so_sku")}
+        out["planned_hours"] = round((r.end - r.start).total_seconds() / 3600, 2)    # budget hours = crew x planned slot
+        return out
 
     def _start_run(self, line: str, wo: str, by: str, how: str, at: datetime | None = None):
         at = at or _now()
@@ -109,7 +125,7 @@ class Ops:
         if cur and cur["wo"] == wo:
             return cur
         if cur:
-            cur["end"], cur["end_reason"] = _iso(at), "switched to WO " + wo
+            cur["end"], cur["end_reason"] = _iso(at), "switched to " + wol(wo)
         run = {"id": uuid.uuid4().hex[:10], "line": line, "wo": wo, "start": _iso(at), "end": None,
                "started_by": by or "", "how": how, "end_reason": "", "units_accepted": None, "units_used": None,
                "notes": "", **self._row_details(line, wo, at)}
@@ -125,7 +141,7 @@ class Ops:
         how = "by hand" if "hand" in reason else ("setup" if "setup" in reason else "schedule")
         by = (self.e.lines.get(gid) or {}).get("started_by", "") if how == "setup" else ""
         at = None
-        if how == "schedule":
+        if how == "schedule" and "ran over" not in reason:
             row = self.e.now_row(gid)
             if row and row.wo == new_wo and row.start >= _now() - timedelta(hours=12):
                 at = row.start.replace(second=0, microsecond=0)   # the WO started at its scheduled time
@@ -134,9 +150,9 @@ class Ops:
             try:
                 moved = self.move_workers(gid, old_wo, new_wo)
                 if moved:
-                    self.e.note("switch", name, f"Moved {len(moved)} people from WO {old_wo} to WO {new_wo}: " + ", ".join(moved))
+                    self.e.note("switch", name, f"Moved {len(moved)} people from {wol(old_wo)} to {wol(new_wo)}: " + ", ".join(moved))
             except Exception as ex:  # noqa
-                self.e.note("error", name, f"Could not move people to WO {new_wo}: {ex}")
+                self.e.note("error", name, f"Could not move people to {wol(new_wo)}: {ex}")
         return self._stuck(gid, new_wo)
 
     def _stuck(self, gid: str, new_wo: str) -> list[dict]:
@@ -260,12 +276,12 @@ class Ops:
         g = self._group(gid)
         allowed = [x["wo"] for x in self.todays_wos(gid)]
         if allowed and wo not in allowed:
-            raise ValueError(f"WO {wo} is not on {g['description']}'s schedule for today. Pick one of: {', '.join(allowed)}")
+            raise ValueError(f"{wol(wo)} is not on {g['description']}'s schedule for today. Pick one of: {', '.join(allowed)}")
         ln = self.e.lines[gid]
         ln["override"], ln["hold"], ln["started_by"] = wo, False, by
         self.e.apply(gid, wo, f"started by setup{(' (' + by + ')') if by else ''}")
         if self.e.preview:
-            self.e.note("preview", g["description"], f"Setup would start WO {wo}" + (f" ({by})" if by else ""))
+            self.e.note("preview", g["description"], f"Setup would start {wol(wo)}" + (f" ({by})" if by else ""))
         return self.open_run(g["description"])
 
     def end(self, gid: str, kind: str, by: str):
@@ -286,12 +302,14 @@ class Ops:
             run["end"], run["end_reason"] = _iso(_now()), ("WO end" if kind == "wo" else "shift end") + (f" ({by})" if by else "")
         self.e.tidy(gid)                                  # nobody is on the line now, so leftover codes can go
         ln = self.e.lines[gid]
+        ln["ended_wo"] = (run or {}).get("wo") or ln.get("live_wo")
         ln["hold"], ln["override"] = True, None          # the line waits for the next setup, a resume,
         ln["hold_kind"], ln["held_at"] = "end", _iso(_now())   # or the next WO in the schedule
+        ln.pop("waiting", None)
         label = "WO end" if kind == "wo" else "Shift end"
         who = f" Clocked off: {', '.join(off)}." if off else " Nobody was clocked in."
         self.e.note("preview" if self.e.preview else "switch", name,
-                    f"{label} for WO {run['wo'] if run else ln.get('live_wo')}" + (f" by {by}" if by else "") + "." +
+                    f"{label} for {wol(run['wo'] if run else ln.get('live_wo'))}" + (f" by {by}" if by else "") + "." +
                     (" Would clock off " + str(len(off)) + " people (preview)." if self.e.preview else who))
         self.e.save()
         return {"clocked_off": off}
@@ -349,7 +367,7 @@ class Ops:
                 if d["failed"]:
                     tcp_note += " Could not move: " + "; ".join(d["failed"]) + "."
         self.downtime.append(d)
-        self.e.note("hold", name, f"Line down on WO {wo}" + (f", reported by {by}" if by else "") + "." + tcp_note)
+        self.e.note("hold", name, f"Line down on {wol(wo)}" + (f", reported by {by}" if by else "") + "." + tcp_note)
         self.e.save()
         return d
 
@@ -400,7 +418,7 @@ class Ops:
         if failed:
             d.setdefault("failed", []).extend(failed)
         mins = round((_dt(d["end"]) - _dt(d["start"])).total_seconds() / 60)
-        msg = f"Line back up after {mins} min on WO {d['wo']}. Reason: {reason}."
+        msg = f"Line back up after {mins} min on {wol(d['wo'])}. Reason: {reason}."
         if back:
             msg += f" Back on their steps in TCP: {', '.join(back)}."
         if left:
@@ -489,6 +507,69 @@ class Ops:
         out["downtime_min"] = round(sum(((_dt(d["end"]) or _now()) - _dt(d["start"])).total_seconds() for d in dts) / 60)
         return out
 
+    def wo_report(self, r: dict) -> dict:
+        """One row of Product Society's work order report (the table in their functional requirements).
+        Filling = SETUP, VERIFY and FILLING steps. QC = QC steps. Other = everything else except LINE REPAIR and LINE DOWN.
+        Unit filling labor = all labor except line repair and line down, divided by FG units accepted."""
+        rep = self.run_report(r)
+        rate = float(self.settings.get("labor_rate") or 0)
+        a, z = _dt(r["start"]), _dt(r["end"]) or _now()
+        durtn = max(0.0, (z - a).total_seconds() / 3600)
+        dt_h = (rep.get("downtime_min") or 0) / 60
+        down = (self.settings.get("line_down_step") or "LINE DOWN").upper()
+        g = next((x for x in self.e.groups.values() if x["description"] == r["line"]), None)
+        jc = self.e.tcp.line_job_code(g["description"]) if g else None
+        segs = self.e.tcp.segments(a - timedelta(hours=1), z + timedelta(minutes=5), jc) if jc else []
+        buckets = {"fill": [0.0, set(), 0], "qc": [0.0, set(), 0], "other": [0.0, set(), 0]}
+        stops = []                                   # (start, end, reason) of Line Repair and Line Down punches in TCP
+        for s in segs:
+            code = (s.get("costCode") or "").upper()
+            if not code.startswith(str(r["wo"]).upper() + "\\"):
+                continue
+            ti, to = _parse(s.get("timeIn")), _parse(s.get("timeOut")) or _now()
+            if not ti:
+                continue
+            h = max(0.0, (min(to, z) - max(ti, a)).total_seconds() / 3600)
+            if not h:
+                continue
+            parts = code.split("\\")
+            step = parts[1]
+            if step in ("LINE REPAIR", down):
+                stops.append((max(ti, a), min(to, z), parts[2].title() if len(parts) > 2 else ("Line down" if step == down else "Line repair")))
+                continue
+            k = "fill" if step in ("SETUP", "VERIFY", "FILLING") else "qc" if step == "QC" else "other"
+            buckets[k][0] += h
+            buckets[k][1].add(str(s.get("employeeId")))
+            buckets[k][2] += 1
+        # downtime = time the line was stopped: overlapping repair and line down punches merged, earliest to latest
+        spans = []
+        for s0, s1, _ in sorted(stops):
+            if spans and s0 <= spans[-1][1]:
+                spans[-1][1] = max(spans[-1][1], s1)
+            else:
+                spans.append([s0, s1])
+        tcp_dt = sum((e - b).total_seconds() for b, e in spans) / 3600
+        dt_h = max(dt_h, tcp_dt)
+        reasons = sorted({x[2] for x in stops})
+        fill_h, fill_p, _ = buckets["fill"]
+        qc_h, _, qc_n = buckets["qc"]
+        oth_h, oth_p, _ = buckets["other"]
+        units, fg, used = r.get("units"), r.get("units_accepted"), r.get("units_used")
+        bw = r.get("workers")
+        plan_h = r.get("planned_hours") or durtn
+        total = (fill_h + qc_h + oth_h) * rate
+        rd = lambda v, n=2: None if v is None else round(v, n)
+        return {"Line": r["line"], "Work Order": r["wo"], "SO-SKU": r.get("so_sku") or "", "Start": r["start"], "End": r.get("end") or "",
+                "Durtn": rd(durtn), "Bgt Units": units, "Tot Units": used, "FG Units": fg,
+                "Scrap": (used - fg) if (used is not None and fg is not None) else None,
+                "DT": rd(dt_h), "DT Reasons": ", ".join(reasons), "Prodn Time": rd(max(0.0, durtn - dt_h)),
+                "Budget Filling Workers": bw, "Actual Filling Workers": len(fill_p),
+                "Budget Labor Hours": rd(bw * plan_h) if bw else None, "Actual Labor Hours": rd(fill_h),
+                "Budget Filling Cost": rd(bw * plan_h * rate) if bw else None, "Actual Filling Cost": rd(fill_h * rate),
+                "QC Picks": qc_n, "QC Hours": rd(qc_h), "QC Cost": rd(qc_h * rate),
+                "Other Workers": len(oth_p), "Other Hours": rd(oth_h), "Other Cost": rd(oth_h * rate),
+                "Total Labor Cost": rd(total), "Unit Filling Labor": rd(total / fg, 4) if fg else None}
+
     def runs_between(self, start: datetime, end: datetime, line: str = "") -> list[dict]:
         out = []
         for r in self.runs:
@@ -538,9 +619,13 @@ class Ops:
         funcs = self.settings.get("functions") or []
         out = []
         for role in roles:
+            reasons = self.settings.get("repair_reasons") or []
             if role == "FILLING" and funcs:
                 for f in funcs:
                     out.append({"level1": str(wo).upper(), "level2": role, "level3": f})
+            elif role == "LINE REPAIR" and reasons:
+                for rsn in reasons:
+                    out.append({"level1": str(wo).upper(), "level2": role, "level3": rsn})
             else:
                 out.append({"level1": str(wo).upper(), "level2": role})
         return out
@@ -559,7 +644,8 @@ class Ops:
         for c in missing:
             last = [c[k] for k in lv[1:] if c.get(k)][-1]
             name = " ".join(x.capitalize() if len(x) > 3 else x for x in last.split())
-            text = f"{desc}: {name}" if desc else name          # Body Lotion 8oz: Capper
+            room = 50 - len(name) - 2                            # TCP keeps 50 characters: never cut the step off
+            text = f"{desc[:room].rstrip(' ,-/')}: {name}" if desc and room > 8 else name   # Body Lotion 8oz: Capper
             body.append({**c, "description": text[:50], "isActive": True, "scheduleOrg": ["default"]})
         failed = []
         try:
@@ -574,8 +660,8 @@ class Ops:
         self.e.tcp.drop_code_cache()
         made = [full(c) for c in missing if not any(f.startswith(full(c) + " (") for f in failed)]
         if failed:
-            self.e.note("error", "Schedule", f"TCP would not create {len(failed)} cost codes for WO {wo}: " + "; ".join(failed))
-        self.e.note("map", "Schedule", f"Created {len(made)} cost codes for WO {wo} in TCP: {', '.join(made)}")
+            self.e.note("error", "Schedule", f"TCP would not create {len(failed)} cost codes for {wol(wo)}: " + "; ".join(failed))
+        self.e.note("map", "Schedule", f"Created {len(made)} cost codes for {wol(wo)} in TCP: {', '.join(made)}")
         return {"created": made, "already": len(want) - len(missing)}
 
 
