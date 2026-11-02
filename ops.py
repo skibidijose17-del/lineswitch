@@ -33,6 +33,7 @@ DEFAULTS = {
     "wait_for_clear": True,
     # phase 1 can run the board as a schedule upload only: hide the line tablet
     "show_tablet": True,
+    "push_later": True,
     # line down is recorded in TCP: every WO gets this step (101\\LINE DOWN) and Line down moves everyone on the
     # line to it; Line back up puts each person back on their own step. Empty = record line down in LineSwitch only.
     "line_down_step": "LINE DOWN",
@@ -84,7 +85,7 @@ class Ops:
                 continue
             if k == "labor_rate":
                 v = max(0.0, float(v))
-            elif k in ("move_on_switch", "auto_create", "wait_for_clear", "show_tablet"):
+            elif k in ("move_on_switch", "auto_create", "wait_for_clear", "show_tablet", "push_later"):
                 v = bool(v)
             elif k == "line_down_step":
                 v = str(v or "").strip().upper()
