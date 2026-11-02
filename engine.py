@@ -37,6 +37,12 @@ def _num(v):
         return None
 
 
+def wol(w) -> str:
+    """WO 112 for a bare number; their own numbers already say it (PS-WO-9555)."""
+    w = str(w if w is not None else "")
+    return f"WO {w}" if w[:1].isdigit() else w
+
+
 def norm(s) -> str:
     return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
 
@@ -84,7 +90,12 @@ HEAD = {
     "workers": "workers", "workersassigned": "workers", "numberofworkers": "workers", "budgetworkers": "workers", "crew": "workers", "headcount": "workers",
     "steps": "steps", "tasks": "steps", "activities": "steps", "wosteps": "steps",
     "sosku": "so_sku", "salesordersku": "so_sku", "salesorder": "so_sku", "so": "so_sku",
+    # Product Society "Production - Weekly Plan" sheet
+    "lineequipment": "line", "shiftstart": "start", "shiftend": "end", "woorderqty": "units", "orderqty": "units",
+    "shift": "shift", "shiftoutput": "output", "filler": "filler", "fillerid": "filler_id",
 }
+DAYS = ("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY")
+DAY_ROW = re.compile(r"^\s*(MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\b\W*([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})", re.I)
 FORMATS = ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y %I:%M %p",
            "%m/%d/%y %H:%M", "%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d %I:%M %p"]
 
@@ -130,18 +141,88 @@ def _dt(v, date=None) -> datetime:
         raise ScheduleError(f"cannot read the date or time {s!r}")
 
 
+def _day_of(v) -> datetime | None:
+    """'MONDAY  •  Oct 26, 2026' -> that date. Anything else -> None."""
+    if isinstance(v, datetime):
+        return None
+    m = DAY_ROW.match(str(v or ""))
+    if not m:
+        return None
+    txt = m.group(2).replace(".", "").replace(",", "")
+    for f in ("%b %d %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(txt, f)
+        except ValueError:
+            pass
+    return None
+
+
+def _weekly_plan(table: list[list]) -> list[Row] | None:
+    """Product Society's weekly plan: a header row (Shift, Line / Equipment, WO #, Item #, Description,
+    WO Order Qty, Shift Start, Shift End, Crew #, Filler ...), then day rows like 'MONDAY • Oct 26, 2026'
+    followed by that day's lines. Rows without a WO or without times (idle lines, cleaning) are skipped.
+    Returns None when the table is not in this format."""
+    hi = next((i for i, r in enumerate(table[:15])
+               if {"line", "wo", "start", "end"} <= {HEAD.get(norm(c), norm(c)) for c in r if c not in (None, "")}), None)
+    if hi is None:
+        return None
+    header = [HEAD.get(norm(c), norm(c)) for c in table[hi]]
+    if not any(_day_of(r[0] if r else None) for r in table[hi + 1:]):
+        return None                                    # a normal sheet with full dates per row
+    rows, day = [], None
+    for n, r in enumerate(table[hi + 1:], start=hi + 2):
+        if not r or all(c in (None, "") for c in r):
+            continue
+        d = _day_of(r[0])
+        if d:
+            day = d
+            continue
+        rec = dict(zip(header, r))
+        wo = str(rec.get("wo") or "").strip().removesuffix(".0")
+        line = str(rec.get("line") or "").strip()
+        if not day or not wo or not line or rec.get("start") in (None, "") or rec.get("end") in (None, ""):
+            continue                                   # week banners, totals, idle lines
+        for k in ("start", "end"):                     # Excel keeps a time only cell as 1899-12-30 06:00
+            if isinstance(rec[k], datetime) and rec[k].year < 1950:
+                rec[k] = rec[k].time()
+        try:
+            start, end = _dt(rec["start"], day), _dt(rec["end"], day)
+        except ScheduleError as e:
+            raise ScheduleError(f"row {n}: {e}")
+        if end <= start:
+            end += timedelta(days=1)                   # 2nd shift running past midnight
+        note = ", ".join(x for x in [f"{rec['shift']} shift" if rec.get("shift") else "",
+                                     " ".join(str(rec.get(k) or "").strip() for k in ("filler", "filler_id") if str(rec.get(k) or "").strip() not in ("", "N/A"))] if x)
+        rows.append(Row(line, wo, start, end, [], note,
+                        sku=str(rec.get("sku") or "").strip().removesuffix(".0"),
+                        sku_desc=" ".join(str(rec.get("sku_desc") or "").split()),
+                        units=_num(rec.get("units")), workers=_num(rec.get("workers")),
+                        so_sku=str(rec.get("so_sku") or "").strip(), steps=_steps(rec.get("steps"))))
+    return rows
+
+
 def parse_schedule(name: str, data: bytes) -> list[Row]:
     if name.lower().endswith((".xlsx", ".xlsm")):
         import openpyxl
-        ws = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True).active
-        it = ws.iter_rows(values_only=True)
-        header = [HEAD.get(norm(h), norm(h)) for h in next(it)]
-        raw = [dict(zip(header, r)) for r in it if r and any(c not in (None, "") for c in r)]
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+        sheets = sorted(wb.worksheets, key=lambda w: (w.sheet_state != "visible", "weeklyplan" not in norm(w.title), w is not wb.active))
+        for ws in sheets:                              # their workbook has many tabs: use the weekly plan one
+            table = [list(r) for r in ws.iter_rows(values_only=True)]
+            plan = _weekly_plan(table)
+            if plan is not None:
+                check_overlaps(plan)
+                return plan
+        table = [list(r) for r in wb.active.iter_rows(values_only=True)]
     else:
-        text = data.decode("utf-8-sig")
-        rd = csv.reader(io.StringIO(text))
-        header = [HEAD.get(norm(h), norm(h)) for h in next(rd)]
-        raw = [dict(zip(header, r)) for r in rd if r and any(c.strip() for c in r)]
+        table = [r for r in csv.reader(io.StringIO(data.decode("utf-8-sig")))]
+        plan = _weekly_plan(table)
+        if plan is not None:
+            check_overlaps(plan)
+            return plan
+    if not table:
+        raise ScheduleError("the file is empty")
+    header = [HEAD.get(norm(h), norm(h)) for h in table[0]]
+    raw = [dict(zip(header, r)) for r in table[1:] if r and any(str(c).strip() not in ("", "None") for c in r if c is not None)]
     rows = []
     for i, r in enumerate(raw, start=2):
         for k in ("line", "wo", "start", "end"):
@@ -169,7 +250,7 @@ def check_overlaps(rows: list[Row]):
     rows.sort(key=lambda x: (norm(x.line), x.start))
     for a, b in zip(rows, rows[1:]):
         if norm(a.line) == norm(b.line) and b.start < a.end:
-            raise ScheduleError(f"{a.line}: WO {a.wo} ({a.start:%b %d %I:%M %p} to {a.end:%I:%M %p}) and WO {b.wo} "
+            raise ScheduleError(f"{a.line}: {wol(a.wo)} ({a.start:%b %d %I:%M %p} to {a.end:%I:%M %p}) and {wol(b.wo)} "
                                 f"(starts {b.start:%I:%M %p}) overlap. Move one of them so they don't share time.")
 
 
@@ -259,7 +340,7 @@ class Engine:
             ok = {norm(r.wo), norm(self.resolve(r.wo))}
             for c in r.codes:
                 if "\\" in c and norm(c.split("\\")[0]) not in ok:
-                    bad.append(f"{r.line} WO {r.wo} lists {c}")
+                    bad.append(f"{r.line} {wol(r.wo)} lists {c}")
         if bad:
             raise ScheduleError("these cost codes belong to a different work order: " + "; ".join(bad[:5])
                                 + (f" and {len(bad) - 5} more" if len(bad) > 5 else "")
@@ -282,13 +363,13 @@ class Engine:
             if r.end <= r.start:
                 r.end += timedelta(days=1)
             if r.end - r.start > timedelta(hours=48):
-                raise ScheduleError(f"WO {r.wo} runs longer than 48 hours. Check its start and end.")
+                raise ScheduleError(f"{wol(r.wo)} runs longer than 48 hours. Check its start and end.")
         keep = [x for x in self.schedule if norm(x.line) != norm(line)]
         self._commit(keep + rows, f"Saved {line} with {len(rows)} work order{'s' if len(rows) != 1 else ''}", line)
 
     def add_row(self, d: dict) -> Row:
         r = self._row_from(d)
-        self._commit(list(self.schedule) + [r], f"Added WO {r.wo} on {r.line}, {r.start:%b %d %I:%M %p} to {r.end:%I:%M %p}", r.line)
+        self._commit(list(self.schedule) + [r], f"Added {wol(r.wo)} on {r.line}, {r.start:%b %d %I:%M %p} to {r.end:%I:%M %p}", r.line)
         return r
 
     def update_row(self, rid: str, d: dict) -> Row:
@@ -297,14 +378,14 @@ class Engine:
             raise ScheduleError("that work order is no longer in the schedule")
         r = self._row_from({**old.to_json(), **d}, keep_id=rid)
         rows = [r if x.id == rid else x for x in self.schedule]
-        self._commit(rows, f"Changed {old.line} WO {old.wo} to WO {r.wo} on {r.line}, {r.start:%b %d %I:%M %p} to {r.end:%I:%M %p}", r.line)
+        self._commit(rows, f"Changed {old.line} {wol(old.wo)} to {wol(r.wo)} on {r.line}, {r.start:%b %d %I:%M %p} to {r.end:%I:%M %p}", r.line)
         return r
 
     def delete_row(self, rid: str):
         old = next((x for x in self.schedule if x.id == rid), None)
         if not old:
             raise ScheduleError("that work order is no longer in the schedule")
-        self._commit([x for x in self.schedule if x.id != rid], f"Removed WO {old.wo} from {old.line} ({old.start:%b %d %I:%M %p})", old.line)
+        self._commit([x for x in self.schedule if x.id != rid], f"Removed {wol(old.wo)} from {old.line} ({old.start:%b %d %I:%M %p})", old.line)
 
     def move_row(self, rid: str, direction: int):
         """Swap a WO with the one before or after it on the same line. The time slots stay, the work orders trade places."""
@@ -321,7 +402,7 @@ class Engine:
             va, vb = getattr(a, k), getattr(b, k)
             setattr(a, k, vb)
             setattr(b, k, va)
-        self._commit(list(self.schedule), f"Swapped WO {b.wo} and WO {a.wo} on {row.line}", row.line)
+        self._commit(list(self.schedule), f"Swapped {wol(b.wo)} and {wol(a.wo)} on {row.line}", row.line)
 
     def restore(self, vid: int):
         rows = self.store.version_rows(vid)
@@ -493,7 +574,7 @@ class Engine:
         """The steps the schedule lists for a WO (first row that has them), and its SKU description."""
         steps, desc = [], ""
         for r in sorted(self.schedule, key=lambda x: x.start):
-            if norm(r.wo) == norm(wo) and r.steps:
+            if norm(r.wo) == norm(wo):
                 steps += [st for st in r.steps if st not in steps]   # Pre-Weigh, Compounding and the line each add theirs
                 desc = desc or r.sku_desc
         return self.with_down(steps), desc
@@ -513,7 +594,7 @@ class Engine:
             pick = [c for c in codes if norm(c["fullName"]) in names]
             if not pick:
                 # the scheduler listed this area's steps but TCP doesn't have them yet: don't fall back to every code of the WO
-                raise TcpError(404, f"WO {tcp_id} steps are not in TCP yet: {', '.join(steps)}")
+                raise TcpError(404, f"{wol(tcp_id)} steps are not in TCP yet: {', '.join(steps)}")
             if pick:
                 order = [norm(f"{tcp_id}\\{st}") for st in steps]
                 pick.sort(key=lambda c: order.index(norm(c["fullName"])))
@@ -531,7 +612,7 @@ class Engine:
             other = [c.get("fullName", "") for c in found
                      if norm(str(c.get("fullName", "")).split("\\")[0]) not in {norm(wo), norm(tcp_id)}]
             if other:
-                raise TcpError(409, f"WO {wo} lists cost codes of another work order: {', '.join(other)}. "
+                raise TcpError(409, f"{wol(wo)} lists cost codes of another work order: {', '.join(other)}. "
                                     "Hours on them would count toward that WO, so the line was not switched.")
             return [{"id": str(c.get("id")), "fullName": c.get("fullName") or "", "description": c.get("description") or "",
                      "isActive": c.get("isActive", True) is not False} for c in found], "listed in the schedule"
@@ -568,7 +649,7 @@ class Engine:
             label = lambda cs: ", ".join(c.get("fullName") or c.get("description") or c.get("id") for c in cs) or "nothing"
             if self.preview:
                 if reason != "tidy":
-                    self.note("preview", name, f"WO {wo} ({reason}): would turn off {label(old)}; add {label(add)}"
+                    self.note("preview", name, f"{wol(wo)} ({reason}): would turn off {label(old)}; add {label(add)}"
                               + (f"; turn on {label(turn_on)}" if turn_on else "") + f". Cost codes {source}.")
             else:
                 if turn_on:
@@ -582,7 +663,7 @@ class Engine:
                     if off or kept:
                         self.note("switch", name, (f"Turned off {label(off)}, nobody is punched in on it now." if off else "") + kept)
                 else:
-                    self.note("switch", name, f"Now WO {wo} ({reason}). Added {label(add)}"
+                    self.note("switch", name, f"Now {wol(wo)} ({reason}). Added {label(add)}"
                               + (f", turned on {label(turn_on)}" if turn_on else "")
                               + f"; turned off {label(off)}.{kept}")
                 g["codes"] = self.tcp.group_codes(g["description"])
@@ -591,7 +672,7 @@ class Engine:
         except Exception as e:  # noqa
             ln["error"] = str(e)
             ln["retry_at"] = time.time() + 120
-            self.note("error", name, f"Could not switch to WO {wo}: {e}")
+            self.note("error", name, f"Could not switch to {wol(wo)}: {e}")
         self.save()
 
     def retire(self, gid: str, old: list[dict], stuck: list[dict]):
@@ -663,9 +744,11 @@ class Engine:
                         held = datetime.fromisoformat(ln.get("held_at") or "")
                     except ValueError:
                         held = now
-                    if nxt and nxt.start > held:
+                    ended = norm(ln.get("ended_wo") or "")
+                    # the next WO in the schedule, or a later row that already started while the ended WO ran long
+                    if nxt and (nxt.start > held or (ended and norm(nxt.wo) != ended)):
                         ln["hold"], ln["hold_kind"] = False, None
-                        self.note("resume", (g or {}).get("description", gid), f"Following the schedule again: WO {nxt.wo} starts at {nxt.start:%H:%M}")
+                        self.note("resume", (g or {}).get("description", gid), f"Following the schedule again: {wol(nxt.wo)} starts at {nxt.start:%H:%M}")
                 if not g or not ln.get("is_line") or ln.get("hold"):
                     continue
                 if ln.get("override"):
@@ -681,7 +764,7 @@ class Engine:
                     target, reason = row.wo, f"schedule {row.start:%H:%M} to {row.end:%H:%M}"
                 chk = self.checks.get(target)
                 if not ln.get("override") and chk and chk["status"] in ("missing", "nocodes"):
-                    msg = f"WO {target} is not ready in TCP: {chk['message']}. Map it in the schedule check."
+                    msg = f"{wol(target)} is not ready in TCP: {chk['message']}. Map it in the schedule check."
                     if ln.get("error") != msg:
                         ln["error"] = msg
                         self.note("error", g["description"], msg)
@@ -692,6 +775,27 @@ class Engine:
                     continue
                 if ln.get("error") and time.time() < ln.get("retry_at", 0):
                     continue
+                cur = ln.get("live_wo")
+                if (not ln.get("override") and cur and norm(cur) != norm(target) and same_mode and not self.preview
+                        and self.ops.settings.get("wait_for_clear")):
+                    # the WO on the line ran past its slot: keep it until nobody is punched in on it any more
+                    try:
+                        still = [p for p in self.ops.people(gid) if (p["costCode"] or "").upper().startswith(str(cur).upper() + "\\")]
+                    except Exception:  # noqa
+                        still = []
+                    if still:
+                        w = ln.get("waiting") or {}
+                        if w.get("wo") != target:
+                            ln["waiting"] = {"wo": target, "since": now.replace(microsecond=0).isoformat(), "count": len(still), "on": cur}
+                            self.note("hold", g["description"], f"{wol(cur)} is still running ({len(still)} {'person' if len(still) == 1 else 'people'} on it), so {wol(target)} waits. "
+                                      f"It starts when everyone on {cur} is clocked out, or when the line lead ends the WO.")
+                            self.save()
+                        else:
+                            w["count"] = len(still)
+                        continue
+                if ln.pop("waiting", None):
+                    self.note("switch", g["description"], f"{wol(cur)} is done, the line is clear. Starting {wol(target)}.")
+                    reason += ", started late because the WO before it ran over"   # the run starts now, not at the slot time
                 self.apply(gid, target, reason, row)
 
     # ---------------- background loop
@@ -726,6 +830,7 @@ class Engine:
                 "jobCodeAssignments": g["jobCodeAssignments"], "codes": [c for c in g["codes"] if c.get("isActive", True)],
                 "live_wo": ln.get("live_wo"), "mode": ln.get("mode"), "hold": ln.get("hold", False),
                 "override": ln.get("override"), "started_by": ln.get("started_by", ""), "error": ln.get("error", ""),
+                "waiting": ln.get("waiting"),
                 "now": cur.to_json() if cur else None, "next": nxt.to_json() if nxt else None,
                 "next_codes": (self.checks.get(self.resolve(nxt.wo), self.checks.get(nxt.wo, {})) or {}).get("codes", []) if nxt else [],
                 "rows": [r.to_json() for r in rows],
