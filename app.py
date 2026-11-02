@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from engine import _steps, Engine, Row, ScheduleError, parse_schedule
+from engine import _steps, Engine, Row, ScheduleError, parse_schedule, wol
 from tcp import API_LOG, Tcp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -126,7 +126,7 @@ async def put_line(request: Request):
             try:
                 start, end = datetime.fromisoformat(str(r["start"])), datetime.fromisoformat(str(r["end"]))
             except Exception:  # noqa
-                raise ScheduleError(f"row {i} (WO {wo}) has a start or end time that can't be read")
+                raise ScheduleError(f"row {i} ({wol(wo)}) has a start or end time that can't be read")
             codes = r.get("codes") or []
             if isinstance(codes, str):
                 codes = [c.strip() for c in codes.replace(";", ",").split(",") if c.strip()]
@@ -183,10 +183,10 @@ async def map_wo(request: Request):
         return JSONResponse({"ok": False, "message": "Missing work order"}, 400)
     if target and target != wo:
         engine.wo_map[wo] = target
-        engine.note("map", "Schedule", f"WO {wo} now maps to TCP job code {target}")
+        engine.note("map", "Schedule", f"{wol(wo)} now maps to TCP job code {target}")
     else:
         engine.wo_map.pop(wo, None)
-        engine.note("map", "Schedule", f"WO {wo} mapping removed")
+        engine.note("map", "Schedule", f"{wol(wo)} mapping removed")
     for ln in engine.lines.values():
         ln["error"], ln["retry_at"] = "", 0
     engine.validate([wo])
@@ -377,7 +377,7 @@ def line_move(gid: str):
         if fails and not moved:
             raise ValueError("TCP would not move: " + "; ".join(fails))
         engine.tidy(gid)
-        engine.note("switch", engine.groups.get(gid, {}).get("description", gid), f"Moved {len(moved)} people to WO {wo}" + (": " + ", ".join(moved) if moved else ""))
+        engine.note("switch", engine.groups.get(gid, {}).get("description", gid), f"Moved {len(moved)} people to {wol(wo)}" + (": " + ", ".join(moved) if moved else ""))
         engine.save()
         return moved
     return _ok(go)
@@ -420,6 +420,61 @@ def runs_csv(start: str = "", end: str = "", line: str = ""):
                                             r.get("started_by"), r.get("people"), r.get("hours"), r.get("cost_hours"), r.get("labor_cost"),
                                             r.get("units"), r.get("units_accepted"), r.get("units_used"), r.get("unit_cost"), r.get("downtime_min")]))
     return Response("\n".join(out) + "\n", media_type="text/csv", headers={"Content-Disposition": "attachment; filename=lineswitch_work_orders.csv"})
+
+
+WO_HEAD = ["Line", "Work Order", "SO-SKU", "Start", "End", "Durtn", "Bgt Units", "Tot Units", "FG Units", "Scrap", "DT", "DT Reasons",
+           "Prodn Time", "Budget Filling Workers", "Actual Filling Workers", "Budget Labor Hours", "Actual Labor Hours",
+           "Budget Filling Cost", "Actual Filling Cost", "QC Picks", "QC Hours", "QC Cost", "Other Workers", "Other Hours", "Other Cost",
+           "Total Labor Cost", "Unit Filling Labor"]
+
+
+@app.get("/api/runs/wo_report.csv")
+def wo_report_csv(start: str = "", end: str = "", line: str = ""):
+    """Product Society's work order report, one row per WO run, same columns as their requirements document."""
+    a, z = _range(start, end)
+    rows = [engine.ops.wo_report(r) for r in engine.ops.runs_between(a, z, line)]
+    head = WO_HEAD
+    q = lambda v: '"' + str("" if v is None else v).replace('"', "'") + '"'
+    out = [",".join(head)] + [",".join(q(r.get(h)) for h in head) for r in rows]
+    return Response("\n".join(out) + "\n", media_type="text/csv", headers={"Content-Disposition": "attachment; filename=lineswitch_wo_report.csv"})
+
+
+@app.get("/api/runs/wo_report.xlsx")
+def wo_report_xlsx(start: str = "", end: str = "", line: str = ""):
+    """The same work order report as an Excel workbook, with a total row."""
+    import io
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    a, z = _range(start, end)
+    rows = [engine.ops.wo_report(r) for r in engine.ops.runs_between(a, z, line)]
+    head = WO_HEAD
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Work orders"
+    ws.append(head)
+    for r in rows:
+        ws.append([r.get(h) for h in head])
+    sums = ["Durtn", "Bgt Units", "Tot Units", "FG Units", "Scrap", "DT", "Prodn Time", "Budget Labor Hours", "Actual Labor Hours",
+            "Budget Filling Cost", "Actual Filling Cost", "QC Picks", "QC Hours", "QC Cost", "Other Hours", "Other Cost", "Total Labor Cost"]
+    tot = ["Total"] + [""] * (len(head) - 1)
+    for h in sums:
+        vals = [r.get(h) for r in rows if isinstance(r.get(h), (int, float))]
+        tot[head.index(h)] = round(sum(vals), 2) if vals else None
+    fg, cost = tot[head.index("FG Units")], tot[head.index("Total Labor Cost")]
+    tot[head.index("Unit Filling Labor")] = round(cost / fg, 4) if fg and cost else None
+    ws.append(tot)
+    navy, blue = PatternFill("solid", fgColor="0A2540"), PatternFill("solid", fgColor="EAF1FC")
+    for c in ws[1]:
+        c.font, c.fill, c.alignment = Font(bold=True, color="FFFFFF"), navy, Alignment(wrap_text=True, vertical="center")
+    for c in ws[ws.max_row]:
+        c.font, c.fill = Font(bold=True), blue
+    for i, h in enumerate(head, start=1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = max(9, min(22, len(h) + 2))
+    ws.freeze_panes = "C2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return Response(buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": "attachment; filename=lineswitch_wo_report.xlsx"})
 
 
 @app.get("/api/downtime")
