@@ -271,7 +271,8 @@ class Tcp:
     def on_line(self, job_code: str) -> list[dict]:
         """Workers clocked in on a line right now: today's segments on its job code with no time out."""
         now = datetime.now()
-        rows = self.segments(now.replace(hour=0, minute=0, second=0) - timedelta(hours=12), now, job_code)
+        # look back 3 days: someone who never clocked out yesterday is still on the line and still holds a code
+        rows = self.segments(now.replace(hour=0, minute=0, second=0) - timedelta(days=3), now, job_code)
         return [r for r in rows if not r.get("timeOut")]
 
     def employees(self) -> dict:
