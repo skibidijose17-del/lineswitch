@@ -90,6 +90,9 @@ class Tcp:
                 time.sleep(min(2 ** attempt, 20))
                 continue
             _log(method, path, params, body, r.status_code, r.text, int((time.time() - t0) * 1000))
+            if r.status_code == 401 and "database connection" in (r.text or "").lower() and attempt < 4:
+                time.sleep(min(2 ** attempt * 2, 20))   # TCP's own database blipped: not a bad token, wait and try again
+                continue
             if r.status_code == 401 and attempt == 1:
                 self._token = None
                 continue
