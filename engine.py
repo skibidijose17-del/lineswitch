@@ -760,6 +760,10 @@ class Engine:
                 else:
                     row = self.now_row(gid, now)
                     if not row:
+                        if ln.get("error"):              # nothing left to switch to, so an old failed switch is no longer a problem
+                            ln["error"], ln["retry_at"] = "", 0
+                            ln.pop("waiting", None)
+                            self.save()
                         continue                         # gap: keep the last WO (change over time stays on it)
                     target, reason = row.wo, f"schedule {row.start:%H:%M} to {row.end:%H:%M}"
                 chk = self.checks.get(target)
